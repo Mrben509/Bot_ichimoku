@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 
 # Essayez d'importer LightGBM et XGBoost (on gère l'absence proprement)
 try:
+    import optuna
     import lightgbm as lgb
     HAS_LGB = True
 except Exception:
@@ -146,35 +147,75 @@ def dump_conf_matrix(cm, labels=("Perdant","Gagnant")):
 def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> EvalResult:
     if not HAS_LGB:
         raise RuntimeError("LightGBM introuvable dans l'environnement.")
+# 1. Optimisation avec optuna
+    def objective_lgb(trial):
+        """
+        Objective function for Optuna. Suggests hyperparameters for LightGBM.
 
-    train_set = lgb.Dataset(X_train, label=y_train)
-    val_set = lgb.Dataset(X_val, label=y_val)
+        Args:
+            trial (optuna.trial.Trial): Optuna trial object.
 
-    params = {
-        "objective": "binary",
-        "metric": "binary_logloss",            # Métrique pour l'early stopping
-        "learning_rate": 0.02,
-        "num_leaves": 64,
-        "max_depth": -1,
-        "min_data_in_leaf": 40,
-        "feature_fraction": 0.9,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 1,
-        "lambda_l1": 0.0,
-        "lambda_l2": 5.0,
-        "verbosity": -1,
-        "seed": RANDOM_STATE,
-        "deterministic": True,
-    }
+        Returns:
+            None
+        """
+        # Define hyperparameters
+        params = {
+            'objective': 'binary',  # Binary classification objective
+            'metric': 'binary_logloss',  # Binary log loss metric
+            'verbosity': -1,  # Silent output
+            'seed': RANDOM_STATE,  # Random seed
+            'deterministic': True,  # Deterministic mode
+            'n_estimators': 1000,  # Number of boosting rounds
+            'learning_rate': trial.suggest_float(  # Learning rate
+                'learning_rate', 0.01, 0.1, log=True),
+            'num_leaves': trial.suggest_int(  # Number of leaves
+                'num_leaves', 20, 150),
+            'max_depth': trial.suggest_int(  # Maximum tree depth
+                'max_depth', 3, 12),
+            'min_child_samples': trial.suggest_int(  # Minimum number of samples
+                'min_child_samples', 5, 100),
+            'feature_fraction': trial.suggest_float(  # Fraction of features
+                'feature_fraction', 0.6, 1.0),
+            'bagging_fraction': trial.suggest_float(  # Bagging fraction
+                'bagging_fraction', 0.6, 1.0),
+            'bagging_freq': trial.suggest_int(  # Bagging frequency
+                'bagging_freq', 1, 7),
+            'lambda_l1': trial.suggest_float(  # L1 regularization
+                'lambda_l1', 1e-8, 10.0, log=True),
+            'lambda_l2': trial.suggest_float(  # L2 regularization
+                'lambda_l2', 1e-8, 10.0, log=True),
+        }
+
+        if scale_pos_weight is not None:
+            params["scale_pos_weight"] = float(scale_pos_weight)
+
+        model = lgb.LGBMClassifier(**params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)])
+
+        preds_val = model.predict_proba(X_val)[:, 1]
+        best_t, best_f1 = search_best_threshold(y_val, preds_val)
+        return best_f1
+
+
+    print("\n[LightGBM] Recherche des hyperparamètres avec optuna…")
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective_lgb, n_trials=50)  # Argumenten_trials pour meilleure recherche
+
+    # 2. Entraînement final avec les meilleurs paramètres
+    print("\n[LightGBMEntraînement final avec les meilleurs paramètres…]")
+    best_params = study.best_params
+    best_params["objective"] = "binary"
+    best_params["metric"] = "binary_logloss"
+    best_params["seed"] = RANDOM_STATE
+    best_params["verbosity"] = -1
     if scale_pos_weight is not None:
-        params["scale_pos_weight"] = float(scale_pos_weight)
+        best_params["scale_pos_weight"] = float(scale_pos_weight)
 
-    print("\n[LightGBM] Entraînement…")
     model = lgb.train(
-        params,
-        train_set,
+        best_params,
+        lgb.Dataset(X_train, label=y_train),
         num_boost_round=5000,
-        valid_sets=[val_set],
+        valid_sets=[lgb.Dataset(X_val, label=y_val)],
         valid_names=["val"],
         callbacks=[
             lgb.early_stopping(stopping_rounds=200, verbose=False),
@@ -223,28 +264,43 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
 def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> EvalResult:
     if not HAS_XGB:
         raise RuntimeError("XGBoost introuvable dans l'environnement.")
+    def objective_xgb(trial):
+        params = {
+            'objective' : 'binary:logistic',
+            'eval_metric' : 'logloss',
+            'tree_method' : 'hist',
+            'n_jobs' : -1,
+            'random_state' : RANDOM_STATE,
+            'learning_rate' : trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'max_depth' : trial.suggest_int('max_depth', 3, 10),
+            'subsample' : trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree' : trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'reg_lambda' : trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+            'reg_alpha' : trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+            'min_child_weight' : trial.suggest_int('min_child_weight', 1, 10),
 
-    params = dict(
-        n_estimators=5000,
-        learning_rate=0.02,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.9,
-        reg_lambda=2.0,
-        reg_alpha=0.0,
-        min_child_weight=1.0,
-        objective='binary:logistic',
-        eval_metric='logloss',  # on optimisera le seuil via F1 ensuite
-        tree_method='hist',
-        n_jobs=-1,
-        early_stopping_rounds=200,  # L'argument doit être ici
-        random_state=RANDOM_STATE,
-    )
+        }
+        if scale_pos_weight is not None:
+            params["scale_pos_weight"] = float(scale_pos_weight)
+
+        model = XGBClassifier(n_estimators=1000, early_stopping_rounds=100, **params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+        preds_val = model.predict_proba(X_val)[:, 1]
+        best_t, best_f1 = search_best_threshold(y_val, preds_val)
+        return best_f1
+
+    print("\n[XGBoost] Recherche des hyperparamètres avec Optuna…")
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective_xgb, n_trials=50)   # Augmenter le n_trials pour une meilleurs recherche
+
+    # 2. Entrainement final avec les meilleurs paramètres
+    print("\n[XGBoost] Entraînement final avec les meilleurs paramètres…")
+    best_params = study.best_params
     if scale_pos_weight is not None:
-        params["scale_pos_weight"] = float(scale_pos_weight)
+        best_params["scale_pos_weight"] = float(scale_pos_weight)
 
-    print("\n[XGBoost] Entraînement…")
-    model = XGBClassifier(**params)
+    model = XGBClassifier(n_estimators=5000, early_stopping_rounds=200, **best_params)
     model.fit(
         X_train, y_train,
         eval_set=[(X_val, y_val)],
