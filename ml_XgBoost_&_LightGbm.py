@@ -256,7 +256,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         metrics_test=metrics_test,
         conf_matrix_test=cm_test,
         extra={"model_path": model_path}
-    )
+    ), model
 
 # -------------------------------
 # 6) XGBoost
@@ -344,7 +344,7 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
         metrics_test=metrics_test,
         conf_matrix_test=cm_test,
         extra={"model_path": model_path}
-    )
+    ), model
 
 # -------------------------------
 # 7) Lancement: calcul du scale_pos_weight puis comparaison
@@ -355,19 +355,58 @@ scale_pos = (neg / pos) if pos > 0 else 1.0
 print(f"\nClasses train → pos={int(pos)}, neg={int(neg)}, scale_pos_weight={scale_pos:.2f}")
 
 results = []
+models = {}
 if HAS_LGB:
     try:
-        res_lgb = train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=scale_pos)
+        res_lgb, model_lgb = train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=scale_pos)
         results.append(res_lgb)
+        models['LightGBM'] = model_lgb
     except Exception as e:
         print("LightGBM a échoué:", e)
 
 if HAS_XGB:
     try:
-        res_xgb = train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=scale_pos)
+        res_xgb, model_xgb = train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=scale_pos)
         results.append(res_xgb)
+        models['XGBoost'] = model_xgb
     except Exception as e:
         print("XGBoost a échoué:", e)
+
+# Création de l'ensemble si les deux modèles on été entraînés
+if 'LightGBM' in models and 'XGBoost' in models:
+    print("\n[Ensemble] Création et évaluation de l'ensemble (Averaging)...")
+    model_lgb = models['LightGBM']
+    model_xgb = models['XGBoost']
+
+    # Prédictions sur le set de validation
+    val_prod_lgb = model_lgb.predict(X_val, num_iteration=model_lgb.best_iteration)
+    val_prob_xgb = model_xgb.predict_proba(X_val)[:, 1]
+    ensemble_val_prob = (val_prod_lgb + val_prob_xgb) / 2.0
+
+    # Recherche du meilleur seuil pour l'ensemble
+    best_t_ensemble, best_f1_ensemble_val = search_best_threshold(y_val, ensemble_val_prob)
+
+    # Évaluation sur le set de test
+    test_prob_lgb = model_lgb.predict(X_test, num_iteration=model_lgb.best_iteration)
+    test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
+    ensemble_test_prob = (test_prob_lgb + test_prob_xgb) / 2.0
+
+    metrics_test_ensemble, y_pred_test_ensemble = evaluate_threshold(y_test, ensemble_test_prob, best_t_ensemble)
+    cm_test_ensemble = confusion_matrix(y_test, y_pred_test_ensemble)
+
+    # Création d'un objet EvalResult pour l'ensemble
+    ensemble_result = EvalResult(
+        name="Ensemble (LGB+XGB)",
+        threshold=best_t_ensemble,
+        metrics_val={"f1": best_f1_ensemble_val}, # Simplifié pour le tri
+        metrics_test=metrics_test_ensemble,
+        conf_matrix_test=cm_test_ensemble,
+        extra={}
+    )
+    results.append(ensemble_result)
+    print("\n[Ensemble] Seuil optimal (val F1):", best_t_ensemble, best_f1_ensemble_val)
+    print("[Ensemble] Metrics test:", metrics_test_ensemble)
+    dump_conf_matrix(cm_test_ensemble)
 
 if not results:
     raise SystemExit("Aucun modèle n'a pu être entraîné. Assurez-vous que LightGBM ou XGBoost est installé.")
