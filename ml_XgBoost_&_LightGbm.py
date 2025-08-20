@@ -1,6 +1,5 @@
 import os
 import json
-import joblib
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ import matplotlib.pyplot as plt
 # Essayez d'importer LightGBM et XGBoost (on gère l'absence proprement)
 try:
     import optuna
+    import joblib
     import lightgbm as lgb
     HAS_LGB = True
 except Exception:
@@ -203,44 +203,41 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
 
     # 2. Entraînement final avec les meilleurs paramètres
     print("\n[LightGBMEntraînement final avec les meilleurs paramètres…]")
-    best_params = study.best_params
-    best_params["objective"] = "binary"
-    best_params["metric"] = "binary_logloss"
-    best_params["seed"] = RANDOM_STATE
-    best_params["verbosity"] = -1
+    best_params = study.best_params.copy()  # Copy pour évité de modifier l'objet de l'étude
+    best_params.update({
+        'objective': 'binary',
+        'metric': 'binary_logloss',
+        'verbosity': -1,
+        'seed': RANDOM_STATE,
+        'n_estimators': 5000
+    })
     if scale_pos_weight is not None:
         best_params["scale_pos_weight"] = float(scale_pos_weight)
 
-    model = lgb.train(
-        best_params,
-        lgb.Dataset(X_train, label=y_train),
-        num_boost_round=5000,
-        valid_sets=[lgb.Dataset(X_val, label=y_val)],
-        valid_names=["val"],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=200, verbose=False),
-            lgb.log_evaluation(period=200)
-        ],
-    )
+    model = lgb.LGBMClassifier(**best_params)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(200, verbose=False)])
 
     # Probabilités validation & recherche seuil
-    val_prob = model.predict(X_val, num_iteration=model.best_iteration)
+    val_prob = model.predict_proba(X_val)[:, 1]
     best_t, best_val_f1 = search_best_threshold(y_val, val_prob, metric="f1")
 
     # Sauvegarde
-    model_path = os.path.join(OUTPUT_DIR, "lightgbm_model.txt")
-    model.save_model(model_path)
+    model_path_txt = os.path.join(OUTPUT_DIR, "lightgbm_model.txt")
+    model_path_joblib = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
+    model.booster_.save_model(model_path_txt)  # On garde le .txt pour référence
+    joblib.dump(model, model_path_joblib)   # On sauvegarde l'objet compler pour la conversion
+    print(f"[]LightGBM] Modèle complet sauvegardé dans : {model_path_joblib}")
     with open(os.path.join(OUTPUT_DIR, "best_threshold_lgb.json"), "w") as f:
         json.dump({"threshold": float(best_t), "best_val_f1": float(best_val_f1)}, f, indent=2)
 
     # Évaluation test
-    test_prob = model.predict(X_test, num_iteration=model.best_iteration)
+    test_prob = model.predict_proba(X_test)[:, 1]
     metrics_val, _ = evaluate_threshold(y_val, val_prob, best_t)
     metrics_test, y_pred_test = evaluate_threshold(y_test, test_prob, best_t)
     cm_test = confusion_matrix(y_test, y_pred_test)
 
     # Importance des features
-    imp_gain = model.feature_importance(importance_type='gain')
+    imp_gain = model.feature_importances_
     imp_df = pd.DataFrame({'feature': FEATURES, 'gain': imp_gain})\
               .sort_values('gain', ascending=False).reset_index(drop=True)
     imp_df.to_csv(os.path.join(OUTPUT_DIR, 'lgb_feature_importance.csv'), index=False)
@@ -255,7 +252,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         metrics_val=metrics_val,
         metrics_test=metrics_test,
         conf_matrix_test=cm_test,
-        extra={"model_path": model_path}
+        extra={"model_path": model_path_joblib}
     ), model
 
 # -------------------------------
@@ -379,7 +376,7 @@ if 'LightGBM' in models and 'XGBoost' in models:
     model_xgb = models['XGBoost']
 
     # Prédictions sur le set de validation
-    val_prod_lgb = model_lgb.predict(X_val, num_iteration=model_lgb.best_iteration)
+    val_prod_lgb = model_lgb.predict_proba(X_val)[:, 1]
     val_prob_xgb = model_xgb.predict_proba(X_val)[:, 1]
     ensemble_val_prob = (val_prod_lgb + val_prob_xgb) / 2.0
 
@@ -387,7 +384,7 @@ if 'LightGBM' in models and 'XGBoost' in models:
     best_t_ensemble, best_f1_ensemble_val = search_best_threshold(y_val, ensemble_val_prob)
 
     # Évaluation sur le set de test
-    test_prob_lgb = model_lgb.predict(X_test, num_iteration=model_lgb.best_iteration)
+    test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
     test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
     ensemble_test_prob = (test_prob_lgb + test_prob_xgb) / 2.0
 
