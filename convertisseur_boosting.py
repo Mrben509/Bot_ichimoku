@@ -93,6 +93,11 @@ c_code = m2c.exporters.export_to_c(model_to_convert)
 function_name = f"{model_type}_score"
 c_code = c_code.replace("score", function_name)
 
+# Remplacer le nom du paramètre d'entrée pour éviter les conflits de mots-clés
+# et utiliser la syntaxe de passage par référence idiomatique de MQL5.
+c_code = c_code.replace("input[", "inputs[")
+c_code = c_code.replace("double * input", "const double &inputs[]")
+
 # On assemble toutes les parties du fichier .mqh
 mqh_lines = [
     "//+------------------------------------------------------------------+",
@@ -101,7 +106,7 @@ mqh_lines = [
     "//+------------------------------------------------------------------+",
     "#property strict",
     "",
-    f"// --- Seuil optimal trouvé pendant l'entraînement (basé sur le F1-score de validation)",
+    f"// --- Seuil optimal trouvé pendant l'entraînement (basé sur des contraintes de performance: fréquence et précision)",
     f"const double BEST_THRESHOLD = {best_threshold:.6f};",
     "",
     "// --- Liste des features attendues par le modèle ---",
@@ -118,10 +123,10 @@ mqh_lines.extend([
     "",
     "// --- Fonction Wrapper pour une utilisation simple dans MQL5 ---",
     f"// Retourne la probabilité de la classe 'Gagnant' (classe 1)",
-    f"double {best_model_name.split(' ')[0]}_Predict(const double &features[])",
+    f"double {best_model_name.split(' ')[0]}_Predict(const double &inputs[])",
     "{",
     "   double prediction[2]; // Sortie pour la classe 0 et la classe 1",
-    f"   {function_name}(features, prediction);",
+    f"   {function_name}(inputs, prediction);",
     "   return prediction[1]; // Retourne la probabilité de la classe 1 (Gagnant)",
     "}",
     "",
