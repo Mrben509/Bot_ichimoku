@@ -108,18 +108,46 @@ class EvalResult:
     extra: Dict[str, Any]
 
 
-def search_best_threshold(y_true, y_prob, metric="f1"):
+def search_best_threshold(y_true, y_prob, df_val, min_trades_per_month=10):
+    """
+    Recherche le meilleur seuil de décision en fonction d'une double contrainte:
+    1. Atteindre une fréquence de trading minimale.
+    2. Parmi les seuils valides, maximiser la précision.
+    """
+    # 1. Calculer la durée du set de validation en mois pour la normalisation
+    start_date = pd.to_datetime(df_val['timeInput'].min())
+    end_date = pd.to_datetime(df_val['timeInput'].max())
+    duration_months = (end_date - start_date).days / 30.44  # Durée moyenne d'un mois
+    if duration_months < 1:
+        duration_months = 1.0  # Eviter la division par 0 pour les petits datesets
+
+    print(f"Durée du set de validation: {duration_months:.2f} mois. Objectif: >= {min_trades_per_month} traders/mois.")
+
     thresholds = np.arange(0.01, 1.00, 0.01)
-    best_t, best_s = 0.5, -np.inf
+
+    # Recherche du seuil F1-max comme baseline
+    f1_scores = [f1_score(y_true, (y_prob >= t).astype(int), zero_division=0) for t in thresholds]
+    best_t_f1 = thresholds[np.argmax(f1_scores)]
+    print(f"Seuil F1-max de référence: {best_t_f1:.2f} (F1: {np.max(f1_scores):.4f})")
+
+    # Recherche du meilleur seuil sous contrainte
+    valid_thresholds = []
     for t in thresholds:
         y_pred = (y_prob >= t).astype(int)
-        if metric == "f1":
-            s = f1_score(y_true, y_pred, zero_division=0)
-        else:
-            raise ValueError("Metric non supportée dans cette fonction")
-        if s > best_s:
-            best_s, best_t = s, t
-    return best_t, best_s
+        num_trades = np.sum(y_pred)
+        trades_per_month = num_trades / duration_months if duration_months > 0 else 0
+
+        if trades_per_month >= min_trades_per_month:
+            precision = precision_score(y_true, y_pred, zero_division=0)
+            valid_thresholds.append({'threshold': t, 'precision': precision, 'trades_per_month': trades_per_month})
+
+    if not valid_thresholds:
+        print(f"AVERTISSEMENT: Aucun seuil n'a atteint l'objectif de {min_trades_per_month} trades/mois. Utilisation du seuil F1-max.")
+        return best_t_f1, np.max(f1_scores)
+
+    # Parmi les seuils valides, choisir celui avec la meilleure précision
+    best_constrained_result = max(valid_thresholds, key=lambda x: x['precision'])
+    return best_constrained_result['threshold'], best_constrained_result['precision']
 
 
 def evaluate_threshold(y_true, y_prob, t):
@@ -193,8 +221,9 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)])
 
         preds_val = model.predict_proba(X_val)[:, 1]
-        best_t, best_f1 = search_best_threshold(y_val, preds_val)
-        return best_f1
+        thresholds = np.arange(0.01, 1.0, 0.01)
+        f1_scores = [f1_score(y_val, (preds_val >= t).astype(int), zero_division=0) for t in thresholds]
+        return np.max(f1_scores)
 
 
     print("\n[LightGBM] Recherche des hyperparamètres avec optuna…")
@@ -219,7 +248,9 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, metric="f1")
+    # On passe le dateframe de validation pour calculer la durée
+    df_val_subset = df.iloc[train_end:val_end]
+    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val_subset, min_trades_per_month=10)
 
     # Sauvegarde
     model_path_txt = os.path.join(OUTPUT_DIR, "lightgbm_model.txt")
@@ -228,7 +259,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
     joblib.dump(model, model_path_joblib)   # On sauvegarde l'objet compler pour la conversion
     print(f"[]LightGBM] Modèle complet sauvegardé dans : {model_path_joblib}")
     with open(os.path.join(OUTPUT_DIR, "best_threshold_lgb.json"), "w") as f:
-        json.dump({"threshold": float(best_t), "best_val_f1": float(best_val_f1)}, f, indent=2)
+        json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_metric)}, f, indent=2)
 
     # Évaluation test
     test_prob = model.predict_proba(X_test)[:, 1]
@@ -242,7 +273,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
               .sort_values('gain', ascending=False).reset_index(drop=True)
     imp_df.to_csv(os.path.join(OUTPUT_DIR, 'lgb_feature_importance.csv'), index=False)
 
-    print("\n[LightGBM] Seuil optimal (val F1):", best_t, best_val_f1)
+    print(f"\n[LightGBM] Seuil optimal (contrainte freq + max precision): {best_t:.2f} (Precision: {best_val_metric:.4f})")
     print("[LightGBM] Metrics test:", metrics_test)
     dump_conf_matrix(cm_test)
 
@@ -284,8 +315,9 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
         preds_val = model.predict_proba(X_val)[:, 1]
-        best_t, best_f1 = search_best_threshold(y_val, preds_val)
-        return best_f1
+        thresholds = np.arange(0.01, 1.0, 0.01)
+        f1_scores = [f1_score(y_val, (preds_val >= t).astype(int), zero_division=0) for t in thresholds]
+        return np.max(f1_scores)
 
     print("\n[XGBoost] Recherche des hyperparamètres avec Optuna…")
     study = optuna.create_study(direction="maximize")
@@ -306,13 +338,15 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, metric="f1")
+    # On passe le dataframe de validation pour calculer la durée
+    df_val_subset =df.iloc[train_end:val_end]
+    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val_subset, min_trades_per_month=10)
 
     # Sauvegarde
     model_path = os.path.join(OUTPUT_DIR, "xgb_model.json")
     model.save_model(model_path)
     with open(os.path.join(OUTPUT_DIR, "best_threshold_xgb.json"), "w") as f:
-        json.dump({"threshold": float(best_t), "best_val_f1": float(best_val_f1)}, f, indent=2)
+        json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_metric)}, f, indent=2)
 
     # Évaluation test
     test_prob = model.predict_proba(X_test)[:, 1]
@@ -330,7 +364,7 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
     }).sort_values('gain', ascending=False).reset_index(drop=True)
     imp_df.to_csv(os.path.join(OUTPUT_DIR, 'xgb_feature_importance.csv'), index=False)
 
-    print("\n[XGBoost] Seuil optimal (val F1):", best_t, best_val_f1)
+    print(f"\n[XGBoost] Seuil optimal (contrainte freq + max precision): {best_t:.2f} (Precision : {best_val_metric:.4f})")
     print("[XGBoost] Metrics test:", metrics_test)
     dump_conf_matrix(cm_test)
 
@@ -381,7 +415,8 @@ if 'LightGBM' in models and 'XGBoost' in models:
     ensemble_val_prob = (val_prod_lgb + val_prob_xgb) / 2.0
 
     # Recherche du meilleur seuil pour l'ensemble
-    best_t_ensemble, best_f1_ensemble_val = search_best_threshold(y_val, ensemble_val_prob)
+    df_val_subset = df.iloc[train_end:val_end]
+    best_t_ensemble, best_metric_ensemble_val = search_best_threshold(y_val, ensemble_val_prob, df_val_subset, min_trades_per_month=10)
 
     # Évaluation sur le set de test
     test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
@@ -395,13 +430,13 @@ if 'LightGBM' in models and 'XGBoost' in models:
     ensemble_result = EvalResult(
         name="Ensemble (LGB+XGB)",
         threshold=best_t_ensemble,
-        metrics_val={"f1": best_f1_ensemble_val}, # Simplifié pour le tri
+        metrics_val={"precision": best_metric_ensemble_val}, # Simplifié pour le tri
         metrics_test=metrics_test_ensemble,
         conf_matrix_test=cm_test_ensemble,
         extra={}
     )
     results.append(ensemble_result)
-    print("\n[Ensemble] Seuil optimal (val F1):", best_t_ensemble, best_f1_ensemble_val)
+    print(f"\n[Ensemble] Seuil optimal (contrainte freq + max precision): {best_t_ensemble:.2f} (Precision: {best_metric_ensemble_val:.4f})")
     print("[Ensemble] Metrics test:", metrics_test_ensemble)
     dump_conf_matrix(cm_test_ensemble)
 
@@ -411,7 +446,7 @@ if not results:
 # -------------------------------
 # 8) Sélection du meilleur modèle (F1 sur validation), évaluation test détaillée
 # -------------------------------
-results = sorted(results, key=lambda r: r.metrics_val["f1"], reverse=True)
+results = sorted(results, key=lambda r: r.metrics_val.get("precision", 0), reverse=True)
 best = results[0]
 
 print("\n========================")
