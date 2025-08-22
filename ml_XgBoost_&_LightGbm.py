@@ -28,7 +28,7 @@ except Exception:
 # -------------------------------
 # 1) Paramètres
 # -------------------------------
-FILE_PATH = "/home/emmanuel-raoul/newòn py/Antrènman_tès/N_XAUUSD_21_22.csv"
+FILE_PATH = "/home/emmanuel-raoul/newòn py/Antrènman_tès/XAUUSD_21_22.csv"
 OUTPUT_DIR = "Antrènan Bot Ichimoku/Antrènan Bot Ichimoku"
 RANDOM_STATE = 42
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -257,7 +257,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
     model_path_joblib = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
     model.booster_.save_model(model_path_txt)  # On garde le .txt pour référence
     joblib.dump(model, model_path_joblib)   # On sauvegarde l'objet compler pour la conversion
-    print(f"[]LightGBM] Modèle complet sauvegardé dans : {model_path_joblib}")
+    print(f"[LightGBM] Modèle complet sauvegardé dans : {model_path_joblib}")
     with open(os.path.join(OUTPUT_DIR, "best_threshold_lgb.json"), "w") as f:
         json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_metric)}, f, indent=2)
 
@@ -484,5 +484,39 @@ try:
     print(f"Matrice de confusion sauvegardée: {fig_path}")
 except Exception as e:
     print("Impossible de tracer la matrice de confusion:", e)
+
+    # -------------------------------
+    # 10) Analyse des erreurs sur le jeu de test
+    # -------------------------------
+print("\n--- Analyse des erreurs du meilleur modèle sur le jeu de test ---")
+
+# Charger le meilleur modèle si ce n'est pas déjà fait
+best_model_name = best.name
+best_model = None
+if "LightGBM" in best_model_name:
+    best_model = models.get("LightGBM")
+elif "XGBoost" in best_model_name:
+    best_model = models.get("XGBoost")
+
+if best_model:
+    # Faire des prédictions sur le jeu de test
+    test_probs = best_model.predict_proba(X_test)[:, 1]
+    test_preds = (test_probs >= best.threshold).astype(int)
+
+    # Créer un DataFrame d'analyse
+    df_test_analysis = df.iloc[val_end:].copy()
+    df_test_analysis['prediction'] = test_preds
+    df_test_analysis['vrai_resultat'] = y_test
+
+    # Isoler les erreurs
+    faux_positifs = df_test_analysis[(df_test_analysis['prediction'] == 1) & (df_test_analysis['vrai_resultat'] == 0)]
+    faux_negatifs = df_test_analysis[(df_test_analysis['prediction'] == 0) & (df_test_analysis['vrai_resultat'] == 1)]
+
+    print(f"\nAnalyse de {len(faux_positifs)} Faux Positifs (trades perdants pris par le modèle):")
+    # Afficher les statistiques des features clés pour ces erreurs
+    print(faux_positifs[FEATURES].describe())
+
+    print(f"\nAnalyse de {len(faux_negatifs)} Faux Négatifs (trades gagnants manqués par le modèle):")
+    print(faux_negatifs[FEATURES].describe())
 
 print("\nFini.")
