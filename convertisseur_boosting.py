@@ -70,6 +70,18 @@ elif "XGBoost" in best_model_name:
     # Pour XGBoost, il est préférable de charger l'objet modèle
     model_to_convert = xgb.XGBClassifier()
     model_to_convert.load_model(model_file)
+
+    # CORRECTIF : m2cgen attend un float pour base_score, mais il peut être chargé comme une chaîne.
+    # On s'assure qu'il est bien de type float avant la conversion.
+    if hasattr(model_to_convert, 'base_score') and isinstance(model_to_convert.base_score, str):
+        print(
+            f"AVERTISSEMENT: Le 'base_score' du modèle XGBoost est une chaîne ('{model_to_convert.base_score}'). Conversion en float.")
+        try:
+            model_to_convert.base_score = float(model_to_convert.base_score)
+        except (ValueError, TypeError):
+            print("ERREUR: Impossible de convertir 'base_score' en float. Le modèle est peut-être corrompu.")
+            sys.exit(1)
+
 else:
     # On ne gère pas l'ensemble pour la conversion directe, car cela nécessiterait
     # de convertir les deux modèles et de combiner leur logique en MQL5.
