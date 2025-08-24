@@ -99,6 +99,10 @@ df['dist_from_spanB'] = (df['price'] - df['spanB']) / df['atrV']
 # Interaction feature for TK cross strength
 df['tk_cross_strength'] = df['tk_cross_signal'] * df['tenkan_slope'].abs()
 
+# --- NOUVELLE FEATURE : Stabilité du signal de croisement ---
+# Compte le nombre de périodes consécutives où le signal de croisement n'a pas changé.
+df['tk_cross_stability'] = df['tk_cross_signal'].rolling(window=5).apply(lambda x: (x == x.iloc[-1]).sum()).fillna(0)
+
 # Features temporelles
 df['hour_of_day'] = pd.to_datetime(df['timeInput']).dt.hour
 
@@ -109,7 +113,7 @@ FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'laggin
             'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
             'risk_reward_ratio', 'ADX_14', 'DMP_14', 'DMN_14', 'cloud_thickness', 'tk_cross_signal',
             'tenkan_slope', 'kijun_slope', 'atr_relative', 'price_vs_kijun', 'dist_from_spanA',
-            'dist_from_spanB', 'tk_cross_strength', 'hour_of_day'] # On ajoute les colonnes de l'ADX
+            'dist_from_spanB', 'tk_cross_strength', 'tk_cross_stability', 'hour_of_day'] # On ajoute les colonnes de l'ADX
 
 print("\nNettoyage des données après feature engineering...")
 # Les calculs (divisions, rolling means) peuvent créer des valeurs invalides (inf, NaN)
@@ -259,6 +263,10 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
                 'lambda_l2', 1e-8, 10.0, log=True),
         }
 
+        # On laisse Optuna trouver le meilleur poids pour les classes
+        if scale_pos_weight is not None:
+            params['scale_pos_weight'] = trial.suggest_float('scale_pos_weight', 1.0, scale_pos_weight * 2.0)
+
         if scale_pos_weight is not None:
             params["scale_pos_weight"] = float(scale_pos_weight)
 
@@ -353,6 +361,10 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
             'min_child_weight' : trial.suggest_int('min_child_weight', 1, 10),
 
         }
+        # On laisse Optuna trouver le meilleur poids pour les classes
+        if scale_pos_weight is not None:
+            params['scale_pos_weight'] = trial.suggest_float('scale_pos_weight', 1.0, scale_pos_weight * 2.0)
+
         if scale_pos_weight is not None:
             params["scale_pos_weight"] = float(scale_pos_weight)
 
