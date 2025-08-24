@@ -1,5 +1,6 @@
 import os
 import json
+import pandas_ta as ta
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -69,14 +70,58 @@ df['distance_to_sl_art'] = (df['price'] - df['sl']) / df['atrV']
 df['volatility_regime'] = (df['priceStd20V'] > df['priceStd20V'].rolling(100, min_periods=1).mean()).astype(int)
 df['prix_vs_ema200'] = (df['price'] - df['price'].rolling(200).mean()) / df['atrV']
 df['rsi_vs_ema_rsi'] = df['rsiV'] - df['rsiV'].rolling(14).mean()
-df['sl_size_in_atr'] = (df['price'] - df['sl']).abs() / df['atrV']
+
+# On calcule le RRR. On gère la division par zéro si le sl est au même niveau que le prix.
+sl_distance = (df['price'] - df['sl']).abs()
+tp_distance = (df['tp'] - df['price']).abs()
+df['risk_reward_ratio'] = tp_distance / sl_distance.replace(0, np.nan)
+
+# --- AJOUT DE FEATURES DISCRIMINANTES - --
+# 1. Features Ichimoku avancées
+df['cloud_thickness'] = (df['spanA'] - df['spanB']).abs()
+df['tk_cross_signal'] = np.sign(df['tenkan'] - df['kijun']) # renomer pour plus de clarté
+
+# 2. Features de Momentum (pentes)
+df['tenkan_slope'] = df['tenkan'].diff(3)  # Pente sur 3 périodes
+df['kijun_slope'] = df['kijun'].diff(3)  # Pente sur 3
+
+# 3. Features de Volatilité et de position relative
+# Relative ATR
+df['atr_relative'] = df['atrV'] / df['atrV'].rolling(50, min_periods=1).mean()
+
+# Price position relative to Kijun (normalized by ATR)
+df['price_vs_kijun'] = (df['price'] - df['kijun']) / df['atrV']
+
+# Distance from cloud edges (normalized by ATR)
+df['dist_from_spanA'] = (df['price'] - df['spanA']) / df['atrV']
+df['dist_from_spanB'] = (df['price'] - df['spanB']) / df['atrV']
+
+# Interaction feature for TK cross strength
+df['tk_cross_strength'] = df['tk_cross_signal'] * df['tenkan_slope'].abs()
+
+# Features temporelles
+df['hour_of_day'] = pd.to_datetime(df['timeInput']).dt.hour
 
 FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
             'price', 'distPriceToCloud', 'distKijunToCloud', 'volume', 'sl', 'tp',
             'slope5V', 'slope10V', 'slope20V',
             'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
             'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
-            'sl_size_in_atr']
+            'risk_reward_ratio', 'ADX_14', 'DMP_14', 'DMN_14', 'cloud_thickness', 'tk_cross_signal',
+            'tenkan_slope', 'kijun_slope', 'atr_relative', 'price_vs_kijun', 'dist_from_spanA',
+            'dist_from_spanB', 'tk_cross_strength', 'hour_of_day'] # On ajoute les colonnes de l'ADX
+
+print("\nNettoyage des données après feature engineering...")
+# Les calculs (divisions, rolling means) peuvent créer des valeurs invalides (inf, NaN)
+# que XGBoost ne peut pas gérer.
+
+# 1. Remplacer les valeurs infinies par NaN
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+# 2. Remplir les valeurs NaN restantes.
+# Une stratégie commune pour les séries temporelles est le "forward fill",
+# puis on remplit les NaNs restants (au début du DF) avec 0.
+df[FEATURES] = df[FEATURES].fillna(method='ffill').fillna(0)
 
 X = df[FEATURES].astype(np.float32).values
 y = df['result'].astype(int).values
@@ -218,7 +263,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
             params["scale_pos_weight"] = float(scale_pos_weight)
 
         model = lgb.LGBMClassifier(**params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)])
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)], feature_name=FEATURES)
 
         preds_val = model.predict_proba(X_val)[:, 1]
         thresholds = np.arange(0.01, 1.0, 0.01)
@@ -405,38 +450,43 @@ if HAS_XGB:
 
 # Création de l'ensemble si les deux modèles on été entraînés
 if 'LightGBM' in models and 'XGBoost' in models:
-    print("\n[Ensemble] Création et évaluation de l'ensemble (Averaging)...")
+    print("\n[Ensemble] Création et évaluation de l'ensemble (Filtre à deux étages)...")
     model_lgb = models['LightGBM']
     model_xgb = models['XGBoost']
+    res_lgb = next(r for r in results if r.name == "LightGBM")
+    res_xgb = next(r for r in results if r.name == "XGBoost")
 
-    # Prédictions sur le set de validation
-    val_prod_lgb = model_lgb.predict_proba(X_val)[:, 1]
-    val_prob_xgb = model_xgb.predict_proba(X_val)[:, 1]
-    ensemble_val_prob = (val_prod_lgb + val_prob_xgb) / 2.0
-
-    # Recherche du meilleur seuil pour l'ensemble
-    df_val_subset = df.iloc[train_end:val_end]
-    best_t_ensemble, best_metric_ensemble_val = search_best_threshold(y_val, ensemble_val_prob, df_val_subset, min_trades_per_month=10)
-
-    # Évaluation sur le set de test
-    test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
+    # Étape 1: Générer les signaux bruts avec le modèle à haut rappel (XGBoost)
     test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
-    ensemble_test_prob = (test_prob_lgb + test_prob_xgb) / 2.0
+    preds_xgb = (test_prob_xgb >= res_xgb.threshold).astype(int)
 
-    metrics_test_ensemble, y_pred_test_ensemble = evaluate_threshold(y_test, ensemble_test_prob, best_t_ensemble)
-    cm_test_ensemble = confusion_matrix(y_test, y_pred_test_ensemble)
+    # Étape 2: Utiliser le modèle à haute précision (LightGBM) comme filtre
+    test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
+    preds_lgb = (test_prob_lgb >= res_lgb.threshold).astype(int)
+
+    # Le trade final n'est pris que si les DEUX modèles sont d'accord
+    ensemble_preds = preds_xgb & preds_lgb
+
+    # Évaluation de la stratégie d'ensemble
+    metrics_test_ensemble = {
+        "accuracy": accuracy_score(y_test, ensemble_preds),
+        "precision": precision_score(y_test, ensemble_preds, zero_division=0),
+        "recall": recall_score(y_test, ensemble_preds, zero_division=0),
+        "f1": f1_score(y_test, ensemble_preds, zero_division=0),
+    }
+    cm_test_ensemble = confusion_matrix(y_test, ensemble_preds)
+
 
     # Création d'un objet EvalResult pour l'ensemble
     ensemble_result = EvalResult(
-        name="Ensemble (LGB+XGB)",
-        threshold=best_t_ensemble,
-        metrics_val={"precision": best_metric_ensemble_val}, # Simplifié pour le tri
+        name="Ensemble (XGB--->LGB Filter)",
+        threshold=np.nan, # Pas de seuil unique pour cette stratégie
+        metrics_val={}, # Pas d'évaluation sur les set de validation pour cette stratégie simple
         metrics_test=metrics_test_ensemble,
         conf_matrix_test=cm_test_ensemble,
         extra={}
     )
     results.append(ensemble_result)
-    print(f"\n[Ensemble] Seuil optimal (contrainte freq + max precision): {best_t_ensemble:.2f} (Precision: {best_metric_ensemble_val:.4f})")
     print("[Ensemble] Metrics test:", metrics_test_ensemble)
     dump_conf_matrix(cm_test_ensemble)
 
@@ -446,7 +496,20 @@ if not results:
 # -------------------------------
 # 8) Sélection du meilleur modèle (F1 sur validation), évaluation test détaillée
 # -------------------------------
-results = sorted(results, key=lambda r: r.metrics_val.get("precision", 0), reverse=True)
+# --- NOUVELLE LOGIQUE DE SÉLECTION ---
+# On définit un score combiné pour équilibrer le F1-score et le winrate (précision).
+# Un F1 élevé est bien, mais un winrate élevé est crucial pour la rentabilité et la psychologie du trading.
+# Vous pouvez ajuster les poids (ex: 0.5/0.5 si vous voulez un poids égal).
+def combined_score(res: EvalResult, f1_weight=0.6, precision_weight=0.4) -> float:
+    f1 = res.metrics_test.get("f1", 0)
+    precision = res.metrics_test.get("precision", 0)  # Le winrate
+    score = f1_weight * f1 + precision_weight * precision
+    print(f"Score combiné pour {res.name:<25}: {score:.4f} (F1: {f1:.2f}, Precision: {precision:.2f})")
+    return score
+
+
+print("\nSélection du meilleur modèle basée sur un score combiné (F1-score + Winrate)...")
+results = sorted(results, key=combined_score, reverse=True)
 best = results[0]
 
 print("\n========================")
@@ -518,5 +581,50 @@ if best_model:
 
     print(f"\nAnalyse de {len(faux_negatifs)} Faux Négatifs (trades gagnants manqués par le modèle):")
     print(faux_negatifs[FEATURES].describe())
+
+    # --- NOUVELLE ANALYSE: Impact d'un filtre de momentum ---
+    print("\n--- Analyse de l'impact d'un filtre de momentum (RSI > 60 ou < 40) ---")
+    df_filtered_analysis = df_test_analysis.copy()
+
+    # On identifie les signaux qui respectent notre filtre de momentum
+    rsi_values = df_filtered_analysis['rsiV']
+    momentum_condition = (rsi_values > 60) | (rsi_values < 40)
+
+    # On ne garde que les prédictions positives qui respectent la condition
+    filtered_preds = df_filtered_analysis['prediction'] & momentum_condition
+
+    # On recalcule les métriques avec ce filtre
+    filtered_metrics = {
+        "accuracy": accuracy_score(y_test, filtered_preds),
+        "precision": precision_score(y_test, filtered_preds, zero_division=0),
+        "recall": recall_score(y_test, filtered_preds, zero_division=0),
+        "f1": f1_score(y_test, filtered_preds, zero_division=0),
+    }
+    print("Nouvelles métriques avec filtre:", filtered_metrics)
+
+# --- NOUVELLE ANALYSE 2: Filtre intelligent basé sur vos conclusions - --
+print("\n--- Analyse de l'impact d'un filtre intelligent (Momentum + Clarté du signal) ---")
+
+# Condition 1: Le nuage ne doit pas être trop épais (marché en range / indécis)
+cloud_filter = df_filtered_analysis['cloud_thickness'] < (df_filtered_analysis['atrV'] * 2)  # Épaisseur < 2x ATR
+
+# Condition 2: Le signal de croisement doit être clair (pas 0)
+tk_cross_filter = df_filtered_analysis['tk_cross_signal'] != 0
+
+# Condition 3: Il doit y avoir un momentum (pente du Kijun non plate)
+kijun_momentum_filter = df_filtered_analysis['kijun_slope'].abs() > 0.05  # Seuil à ajuster
+
+# On combine les filtres
+intelligent_filter = cloud_filter & tk_cross_filter & kijun_momentum_filter
+filtered_preds_intelligent = df_filtered_analysis['prediction'] & intelligent_filter
+
+# On recalcule les métriques, en s 'assurant que zero_division n'est passé qu'aux fonctions qui le supportent.
+intelligent_metrics = {
+    "accuracy": accuracy_score(y_test, filtered_preds_intelligent),
+    "precision": precision_score(y_test, filtered_preds_intelligent, zero_division=0),
+    "recall": recall_score(y_test, filtered_preds_intelligent, zero_division=0),
+    "f1": f1_score(y_test, filtered_preds_intelligent, zero_division=0),
+}
+print("Nouvelles métriques avec filtre intelligent:", intelligent_metrics)
 
 print("\nFini.")
