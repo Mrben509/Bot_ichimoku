@@ -8,8 +8,9 @@ from typing import Dict, Any
 
 from lightgbm import early_stopping
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, confusion_matrix, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 import matplotlib.pyplot as plt
+import warnings
 
 # Essayez d'importer LightGBM et XGBoost (on gère l'absence proprement)
 try:
@@ -26,6 +27,8 @@ try:
 except Exception:
     HAS_XGB = False
 
+# Ignorer les avertissement de dépréciation de pandas
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 # -------------------------------
 # 1) Paramètres
 # -------------------------------
@@ -125,24 +128,10 @@ df.replace([np.inf, -np.inf], np.nan, inplace=True)
 # 2. Remplir les valeurs NaN restantes.
 # Une stratégie commune pour les séries temporelles est le "forward fill",
 # puis on remplit les NaNs restants (au début du DF) avec 0.
-df[FEATURES] = df[FEATURES].fillna(method='ffill').fillna(0)
+df[FEATURES] = df[FEATURES].ffill().fillna(0)
 
 X = df[FEATURES].astype(np.float32).values
 y = df['result'].astype(int).values
-
-# -------------------------------
-# 3) Split temporel 70/15/15
-# -------------------------------
-N = len(df)
-train_end = int(0.70 * N)
-val_end = int(0.85 * N)
-
-X_train, y_train = X[:train_end], y[:train_end]
-X_val,   y_val   = X[train_end:val_end], y[train_end:val_end]
-X_test,  y_test  = X[val_end:], y[val_end:]
-
-print(f"Total samples: {N}")
-print(f"Splitting info: Train={len(X_train)}, Validation={len(X_val)}, Test={len(X_test)}")
 
 # -------------------------------
 # 4) Utils
@@ -221,7 +210,7 @@ def dump_conf_matrix(cm, labels=("Perdant","Gagnant")):
 # -------------------------------
 # 5) LightGBM
 # -------------------------------
-def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> EvalResult:
+def train_lightgbm(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None) -> (EvalResult, Any):
     if not HAS_LGB:
         raise RuntimeError("LightGBM introuvable dans l'environnement.")
 # 1. Optimisation avec optuna
@@ -267,9 +256,6 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         if scale_pos_weight is not None:
             params['scale_pos_weight'] = trial.suggest_float('scale_pos_weight', 1.0, scale_pos_weight * 2.0)
 
-        if scale_pos_weight is not None:
-            params["scale_pos_weight"] = float(scale_pos_weight)
-
         model = lgb.LGBMClassifier(**params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)], feature_name=FEATURES)
 
@@ -281,7 +267,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
 
     print("\n[LightGBM] Recherche des hyperparamètres avec optuna…")
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective_lgb, n_trials=50)  # Argumenten_trials pour meilleure recherche
+    study.optimize(objective_lgb, n_trials=150)  # Argumenten_trials pour meilleure recherche
 
     # 2. Entraînement final avec les meilleurs paramètres
     print("\n[LightGBMEntraînement final avec les meilleurs paramètres…]")
@@ -293,19 +279,16 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         'seed': RANDOM_STATE,
         'n_estimators': 5000
     })
-    if scale_pos_weight is not None:
-        best_params["scale_pos_weight"] = float(scale_pos_weight)
 
     model = lgb.LGBMClassifier(**best_params)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(200, verbose=False)])
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    # On passe le dateframe de validation pour calculer la durée
-    df_val_subset = df.iloc[train_end:val_end]
-    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val_subset, min_trades_per_month=10)
+    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val, min_trades_per_month=10)
 
     # Sauvegarde
+    # NOTE: Dans un contexte de CV, on sauvegarde le modèle du dernier pli.
     model_path_txt = os.path.join(OUTPUT_DIR, "lightgbm_model.txt")
     model_path_joblib = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
     model.booster_.save_model(model_path_txt)  # On garde le .txt pour référence
@@ -314,11 +297,8 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
     with open(os.path.join(OUTPUT_DIR, "best_threshold_lgb.json"), "w") as f:
         json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_metric)}, f, indent=2)
 
-    # Évaluation test
-    test_prob = model.predict_proba(X_test)[:, 1]
+    # Évaluation sur le set de validation
     metrics_val, _ = evaluate_threshold(y_val, val_prob, best_t)
-    metrics_test, y_pred_test = evaluate_threshold(y_test, test_prob, best_t)
-    cm_test = confusion_matrix(y_test, y_pred_test)
 
     # Importance des features
     imp_gain = model.feature_importances_
@@ -326,23 +306,21 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
               .sort_values('gain', ascending=False).reset_index(drop=True)
     imp_df.to_csv(os.path.join(OUTPUT_DIR, 'lgb_feature_importance.csv'), index=False)
 
-    print(f"\n[LightGBM] Seuil optimal (contrainte freq + max precision): {best_t:.2f} (Precision: {best_val_metric:.4f})")
-    print("[LightGBM] Metrics test:", metrics_test)
-    dump_conf_matrix(cm_test)
+    print(f"\n[LightGBM] Seuil optimal trouvé sur validation: {best_t:.2f} (Precision: {best_val_metric:.4f}))")
 
     return EvalResult(
         name="LightGBM",
         threshold=best_t,
         metrics_val=metrics_val,
-        metrics_test=metrics_test,
-        conf_matrix_test=cm_test,
+        metrics_test=None, # Sera rempli dans la boucle de CV
+        conf_matrix_test=None, # Sera rempli dans la boucle de CV
         extra={"model_path": model_path_joblib}
     ), model
 
 # -------------------------------
 # 6) XGBoost
 # -------------------------------
-def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> EvalResult:
+def train_xgboost(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None) -> (EvalResult, Any):
     if not HAS_XGB:
         raise RuntimeError("XGBoost introuvable dans l'environnement.")
     def objective_xgb(trial):
@@ -365,9 +343,6 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
         if scale_pos_weight is not None:
             params['scale_pos_weight'] = trial.suggest_float('scale_pos_weight', 1.0, scale_pos_weight * 2.0)
 
-        if scale_pos_weight is not None:
-            params["scale_pos_weight"] = float(scale_pos_weight)
-
         model = XGBClassifier(n_estimators=1000, early_stopping_rounds=100, **params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
@@ -378,13 +353,19 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
 
     print("\n[XGBoost] Recherche des hyperparamètres avec Optuna…")
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective_xgb, n_trials=50)   # Augmenter le n_trials pour une meilleurs recherche
+    study.optimize(objective_xgb, n_trials=150)   # Augmenter le n_trials pour une meilleurs recherche
 
     # 2. Entrainement final avec les meilleurs paramètres
     print("\n[XGBoost] Entraînement final avec les meilleurs paramètres…")
-    best_params = study.best_params
-    if scale_pos_weight is not None:
-        best_params["scale_pos_weight"] = float(scale_pos_weight)
+    best_params = study.best_params.copy()
+    # CORRECTIF CRITIQUE : Il faut rajouter les paramètres statiques qui ne sont pas optimisés par Optuna.
+    best_params.update({
+        'objective': 'binary:logistic',
+        'eval_metric': 'logloss',
+        'tree_method': 'hist',
+        'n_jobs': -1,
+        'random_state': RANDOM_STATE,
+    })
 
     model = XGBClassifier(n_estimators=5000, early_stopping_rounds=200, **best_params)
     model.fit(
@@ -395,9 +376,7 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    # On passe le dataframe de validation pour calculer la durée
-    df_val_subset =df.iloc[train_end:val_end]
-    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val_subset, min_trades_per_month=10)
+    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val, min_trades_per_month=10)
 
     # Sauvegarde
     model_path = os.path.join(OUTPUT_DIR, "xgb_model.json")
@@ -405,11 +384,8 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
     with open(os.path.join(OUTPUT_DIR, "best_threshold_xgb.json"), "w") as f:
         json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_metric)}, f, indent=2)
 
-    # Évaluation test
-    test_prob = model.predict_proba(X_test)[:, 1]
+    # Évaluation sur le set de validation
     metrics_val, _ = evaluate_threshold(y_val, val_prob, best_t)
-    metrics_test, y_pred_test = evaluate_threshold(y_test, test_prob, best_t)
-    cm_test = confusion_matrix(y_test, y_pred_test)
 
     # Importance des features (gain)
     booster = model.get_booster()
@@ -421,88 +397,147 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
     }).sort_values('gain', ascending=False).reset_index(drop=True)
     imp_df.to_csv(os.path.join(OUTPUT_DIR, 'xgb_feature_importance.csv'), index=False)
 
-    print(f"\n[XGBoost] Seuil optimal (contrainte freq + max precision): {best_t:.2f} (Precision : {best_val_metric:.4f})")
-    print("[XGBoost] Metrics test:", metrics_test)
-    dump_conf_matrix(cm_test)
+    print(f"\n[XGBoost] Seuil optimal trouvé sur validation: {best_t:.2f} (Precision : {best_val_metric:.4f})")
 
     return EvalResult(
         name="XGBoost",
         threshold=best_t,
         metrics_val=metrics_val,
-        metrics_test=metrics_test,
-        conf_matrix_test=cm_test,
+        metrics_test=None, # Sera remplit dans la boucle de CV
+        conf_matrix_test=None, # Sera rempli dans la boucle de CV
         extra={"model_path": model_path}
     ), model
 
 # -------------------------------
 # 7) Lancement: calcul du scale_pos_weight puis comparaison
 # -------------------------------
-pos = y_train.sum()
-neg = len(y_train) - pos
-scale_pos = (neg / pos) if pos > 0 else 1.0
-print(f"\nClasses train → pos={int(pos)}, neg={int(neg)}, scale_pos_weight={scale_pos:.2f}")
 
-results = []
-models = {}
-if HAS_LGB:
-    try:
-        res_lgb, model_lgb = train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=scale_pos)
-        results.append(res_lgb)
-        models['LightGBM'] = model_lgb
-    except Exception as e:
-        print("LightGBM a échoué:", e)
+N_SPLITS = 5  # Nombre de plis pour la validation croisée
+tscv = TimeSeriesSplit(n_splits=N_SPLITS)
 
-if HAS_XGB:
-    try:
-        res_xgb, model_xgb = train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=scale_pos)
-        results.append(res_xgb)
-        models['XGBoost'] = model_xgb
-    except Exception as e:
-        print("XGBoost a échoué:", e)
+all_results = []
 
-# Création de l'ensemble si les deux modèles on été entraînés
-if 'LightGBM' in models and 'XGBoost' in models:
-    print("\n[Ensemble] Création et évaluation de l'ensemble (Filtre à deux étages)...")
-    model_lgb = models['LightGBM']
-    model_xgb = models['XGBoost']
-    res_lgb = next(r for r in results if r.name == "LightGBM")
-    res_xgb = next(r for r in results if r.name == "XGBoost")
+print(f"\nLancement de la validation croisée temporelle avec {N_SPLITS} plis...")
 
-    # Étape 1: Générer les signaux bruts avec le modèle à haut rappel (XGBoost)
-    test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
-    preds_xgb = (test_prob_xgb >= res_xgb.threshold).astype(int)
+for fold, (train_val_index, test_index) in enumerate(tscv.split(X)):
+    print(f"\n{'=' * 20} FOLD {fold + 1}/{N_SPLITS} {'=' * 20}")
 
-    # Étape 2: Utiliser le modèle à haute précision (LightGBM) comme filtre
-    test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
-    preds_lgb = (test_prob_lgb >= res_lgb.threshold).astype(int)
+    # 1. Découper les données pour le pli actuel
+    X_train_val, y_train_val = X[train_val_index], y[train_val_index]
+    X_test, y_test = X[test_index], y[test_index]
 
-    # Le trade final n'est pris que si les DEUX modèles sont d'accord
-    ensemble_preds = preds_xgb & preds_lgb
+    # 2. Créer un sous-ensemble de validation à partir de la fin du jeu d'entraînement
+    #    pour Optuna et l'early stopping.
+    val_size = int(len(X_train_val) * 0.20)  # 20% pour la validation
+    train_size = len(X_train_val) - val_size
+    X_train, y_train = X_train_val[:train_size], y_train_val[:train_size]
+    X_val, y_val = X_train_val[train_size:], y_train_val[train_size:]
+    df_train_val = df.iloc[train_val_index]
+    df_val = df_train_val.iloc[train_size:]
+    print(f"Fold {fold + 1} split: Train={len(X_train)}, Validation={len(X_val)}, Test={len(X_test)}")
 
-    # Évaluation de la stratégie d'ensemble
-    metrics_test_ensemble = {
-        "accuracy": accuracy_score(y_test, ensemble_preds),
-        "precision": precision_score(y_test, ensemble_preds, zero_division=0),
-        "recall": recall_score(y_test, ensemble_preds, zero_division=0),
-        "f1": f1_score(y_test, ensemble_preds, zero_division=0),
-    }
-    cm_test_ensemble = confusion_matrix(y_test, ensemble_preds)
+    # 3. Calculer le scale_pos_weight pour ce pli
+    pos = y_train.sum()
+    neg = len(y_train) - pos
+    scale_pos = (neg / pos) if pos > 0 else 1.0
+    print(f"Classes train (fold {fold + 1}) → pos={int(pos)}, neg={int(neg)}, scale_pos_weight={scale_pos:.2f}")
 
+    fold_models = {}
+    fold_results_list = []
 
-    # Création d'un objet EvalResult pour l'ensemble
-    ensemble_result = EvalResult(
-        name="Ensemble (XGB--->LGB Filter)",
-        threshold=np.nan, # Pas de seuil unique pour cette stratégie
-        metrics_val={}, # Pas d'évaluation sur les set de validation pour cette stratégie simple
-        metrics_test=metrics_test_ensemble,
-        conf_matrix_test=cm_test_ensemble,
-        extra={}
-    )
-    results.append(ensemble_result)
-    print("[Ensemble] Metrics test:", metrics_test_ensemble)
-    dump_conf_matrix(cm_test_ensemble)
+    # 4. Entraîner les modèles sur ce pli
+    if HAS_LGB:
+        try:
+            res_lgb, model_lgb = train_lightgbm(X_train, y_train, X_val, y_val, df_val,
+                                                scale_pos_weight=scale_pos)
 
-if not results:
+            # Évaluation sur le jeu de test du pli
+            test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
+            res_lgb.metrics_test, y_pred_test_lgb = evaluate_threshold(y_test, test_prob_lgb, res_lgb.threshold)
+            res_lgb.conf_matrix_test = confusion_matrix(y_test, y_pred_test_lgb)
+            print(f"[LightGBM] Metrics test (fold {fold + 1}):",
+                  {k: round(v, 4) for k, v in res_lgb.metrics_test.items()})
+            dump_conf_matrix(res_lgb.conf_matrix_test)
+
+            fold_results_list.append(res_lgb)
+            fold_models['LightGBM'] = model_lgb
+        except Exception as e:
+            print(f"LightGBM a échoué pour le fold {fold + 1}:", e)
+
+    if HAS_XGB:
+        try:
+            res_xgb, model_xgb = train_xgboost(X_train, y_train, X_val, y_val, df_val,
+                                               scale_pos_weight=scale_pos)
+
+            # Évaluation sur le jeu de test du pli
+            test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
+            res_xgb.metrics_test, y_pred_test_xgb = evaluate_threshold(y_test, test_prob_xgb, res_xgb.threshold)
+            res_xgb.conf_matrix_test = confusion_matrix(y_test, y_pred_test_xgb)
+            print(f"[XGBoost] Metrics test (fold {fold + 1}):",
+                  {k: round(v, 4) for k, v in res_xgb.metrics_test.items()})
+            dump_conf_matrix(res_xgb.conf_matrix_test)
+
+            fold_results_list.append(res_xgb)
+            fold_models['XGBoost'] = model_xgb
+        except Exception as e:
+            print(f"XGBoost a échoué pour le fold {fold + 1}:", e)
+
+    # 5. Créer l'ensemble pour ce pli
+    if 'LightGBM' in fold_models and 'XGBoost' in fold_models:
+        print("\n[Ensemble] Création et évaluation de l'ensemble (Filtre à deux étages)...")
+        model_lgb = fold_models['LightGBM']
+        model_xgb = fold_models['XGBoost']
+        res_lgb = next(r for r in fold_results_list if r.name == "LightGBM")
+        res_xgb = next(r for r in fold_results_list if r.name == "XGBoost")
+
+        test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
+        preds_xgb = (test_prob_xgb >= res_xgb.threshold).astype(int)
+        test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
+        preds_lgb = (test_prob_lgb >= res_lgb.threshold).astype(int)
+        ensemble_preds = preds_xgb & preds_lgb
+
+        metrics_test_ensemble = {
+            "accuracy": accuracy_score(y_test, ensemble_preds),
+            "precision": precision_score(y_test, ensemble_preds, zero_division=0),
+            "recall": recall_score(y_test, ensemble_preds, zero_division=0),
+            "f1": f1_score(y_test, ensemble_preds, zero_division=0),
+        }
+        cm_test_ensemble = confusion_matrix(y_test, ensemble_preds)
+
+        ensemble_result = EvalResult(
+            name="Ensemble (XGB--->LGB Filter)",
+            threshold=np.nan, metrics_val={},
+            metrics_test=metrics_test_ensemble,
+            conf_matrix_test=cm_test_ensemble, extra={}
+        )
+        fold_results_list.append(ensemble_result)
+        print("[Ensemble] Metrics test:", {k: round(v, 4) for k, v in metrics_test_ensemble.items()})
+        dump_conf_matrix(cm_test_ensemble)
+
+    all_results.extend(fold_results_list)
+
+# --- Agrégation des résultats de la validation croisée ---
+print(f"\n{'=' * 20} RÉSULTATS GLOBAUX (moyenne sur {N_SPLITS} plis) {'=' * 20}")
+final_summary = {}
+for res in all_results:
+    if res.name not in final_summary:
+        final_summary[res.name] = {'metrics_test': []}
+    final_summary[res.name]['metrics_test'].append(res.metrics_test)
+
+aggregated_results = []
+for name, data in final_summary.items():
+    df_metrics = pd.DataFrame(data['metrics_test'])
+    mean_metrics = df_metrics.mean().to_dict()
+    print(f"\n--- {name} ---")
+    print(df_metrics.round(4))
+    print("\nMoyenne:")
+    print(pd.Series(mean_metrics).round(4))
+    # On crée un EvalResult final avec les métriques moyennées
+    aggregated_results.append(
+        EvalResult(name=name, threshold=np.nan, metrics_val={}, metrics_test=mean_metrics, conf_matrix_test=None,
+                   extra={}))
+
+if not aggregated_results:
     raise SystemExit("Aucun modèle n'a pu être entraîné. Assurez-vous que LightGBM ou XGBoost est installé.")
 
 # -------------------------------
@@ -521,21 +556,25 @@ def combined_score(res: EvalResult, f1_weight=0.6, precision_weight=0.4) -> floa
 
 
 print("\nSélection du meilleur modèle basée sur un score combiné (F1-score + Winrate)...")
-results = sorted(results, key=combined_score, reverse=True)
-best = results[0]
+aggregated_results_sorted = sorted(aggregated_results, key=combined_score, reverse=True)
+best = aggregated_results_sorted[0]
 
 print("\n========================")
 print("Meilleur modèle:", best.name)
-print("Seuil optimal (val F1):", round(best.threshold, 4))
-print("Metrics validation:", best.metrics_val)
-print("Metrics test:", best.metrics_test)
+print("\nPerformance moyenne sur les plis de test:")
+for k, v in best.metrics_test.items():
+    print(f" - {k:<10}: {v:.4f}")
 print("========================\n")
 
 # Sauvegarde d'un récapitulatif JSON
+# NOTE: Pour la sauvegarde finale du modèle pour MQL5, il faudrait le ré-entraîner sur TOUTES les données
+ # en utilisant les meilleurs hyperparamètres trouvés. Cette partie est omise pour la simplicité de l'exemple.
+ # Le résumé ici est basé sur les performances moyennes de la CV.
+
 summary = {
     "best_model": best.name,
-    "threshold": float(best.threshold),
-    "val_metrics": {k: float(v) for k, v in best.metrics_val.items()},
+    "threshold": "N/A (Cross-Validation)", # Un seuil unique n'a pas de sens ici
+    "val_metrics": {},
     "test_metrics": {k: float(v) for k, v in best.metrics_test.items()},
 }
 with open(os.path.join(OUTPUT_DIR, "summary_boosting.json"), "w") as f:
@@ -545,98 +584,27 @@ with open(os.path.join(OUTPUT_DIR, "summary_boosting.json"), "w") as f:
 # 9) (Optionnel) Affichage matrice de confusion du meilleur modèle
 # -------------------------------
 try:
-    import seaborn as sns
-    cm = best.conf_matrix_test
-    plt.figure(figsize=(6,5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Perdant','Gagnant'], yticklabels=['Perdant','Gagnant'])
-    plt.title(f"Matrice de confusion – {best.name}")
-    plt.xlabel('Prédit')
-    plt.ylabel('Vrai')
-    fig_path = os.path.join(OUTPUT_DIR, f"cm_{best.name.lower()}.png")
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=130)
-    print(f"Matrice de confusion sauvegardée: {fig_path}")
+    if best.conf_matrix_test is None:
+        print("\nPas de matrice de confusion à afficher pour les résultats agrégés.")
+    else:
+        import seaborn as sns
+        cm = best.conf_matrix_test
+        plt.figure(figsize=(6,5))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['Perdant','Gagnant'], yticklabels=['Perdant','Gagnant'])
+        plt.title(f"Matrice de confusion – {best.name}")
+        plt.xlabel('Prédit')
+        plt.ylabel('Vrai')
+        fig_path = os.path.join(OUTPUT_DIR, f"cm_{best.name.lower()}.png")
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=130)
+        plt.close() # Important pour fermer la figure et ne pas bloquer le script
+        print(f"Matrice de confusion sauvegardée: {fig_path}")
 except Exception as e:
     print("Impossible de tracer la matrice de confusion:", e)
 
-    # -------------------------------
-    # 10) Analyse des erreurs sur le jeu de test
-    # -------------------------------
-print("\n--- Analyse des erreurs du meilleur modèle sur le jeu de test ---")
 
-# Charger le meilleur modèle si ce n'est pas déjà fait
-best_model_name = best.name
-best_model = None
-if "LightGBM" in best_model_name:
-    best_model = models.get("LightGBM")
-elif "XGBoost" in best_model_name:
-    best_model = models.get("XGBoost")
-
-if best_model:
-    # Faire des prédictions sur le jeu de test
-    test_probs = best_model.predict_proba(X_test)[:, 1]
-    test_preds = (test_probs >= best.threshold).astype(int)
-
-    # Créer un DataFrame d'analyse
-    df_test_analysis = df.iloc[val_end:].copy()
-    df_test_analysis['prediction'] = test_preds
-    df_test_analysis['vrai_resultat'] = y_test
-
-    # Isoler les erreurs
-    faux_positifs = df_test_analysis[(df_test_analysis['prediction'] == 1) & (df_test_analysis['vrai_resultat'] == 0)]
-    faux_negatifs = df_test_analysis[(df_test_analysis['prediction'] == 0) & (df_test_analysis['vrai_resultat'] == 1)]
-
-    print(f"\nAnalyse de {len(faux_positifs)} Faux Positifs (trades perdants pris par le modèle):")
-    # Afficher les statistiques des features clés pour ces erreurs
-    print(faux_positifs[FEATURES].describe())
-
-    print(f"\nAnalyse de {len(faux_negatifs)} Faux Négatifs (trades gagnants manqués par le modèle):")
-    print(faux_negatifs[FEATURES].describe())
-
-    # --- NOUVELLE ANALYSE: Impact d'un filtre de momentum ---
-    print("\n--- Analyse de l'impact d'un filtre de momentum (RSI > 60 ou < 40) ---")
-    df_filtered_analysis = df_test_analysis.copy()
-
-    # On identifie les signaux qui respectent notre filtre de momentum
-    rsi_values = df_filtered_analysis['rsiV']
-    momentum_condition = (rsi_values > 60) | (rsi_values < 40)
-
-    # On ne garde que les prédictions positives qui respectent la condition
-    filtered_preds = df_filtered_analysis['prediction'] & momentum_condition
-
-    # On recalcule les métriques avec ce filtre
-    filtered_metrics = {
-        "accuracy": accuracy_score(y_test, filtered_preds),
-        "precision": precision_score(y_test, filtered_preds, zero_division=0),
-        "recall": recall_score(y_test, filtered_preds, zero_division=0),
-        "f1": f1_score(y_test, filtered_preds, zero_division=0),
-    }
-    print("Nouvelles métriques avec filtre:", filtered_metrics)
-
-# --- NOUVELLE ANALYSE 2: Filtre intelligent basé sur vos conclusions - --
-print("\n--- Analyse de l'impact d'un filtre intelligent (Momentum + Clarté du signal) ---")
-
-# Condition 1: Le nuage ne doit pas être trop épais (marché en range / indécis)
-cloud_filter = df_filtered_analysis['cloud_thickness'] < (df_filtered_analysis['atrV'] * 2)  # Épaisseur < 2x ATR
-
-# Condition 2: Le signal de croisement doit être clair (pas 0)
-tk_cross_filter = df_filtered_analysis['tk_cross_signal'] != 0
-
-# Condition 3: Il doit y avoir un momentum (pente du Kijun non plate)
-kijun_momentum_filter = df_filtered_analysis['kijun_slope'].abs() > 0.05  # Seuil à ajuster
-
-# On combine les filtres
-intelligent_filter = cloud_filter & tk_cross_filter & kijun_momentum_filter
-filtered_preds_intelligent = df_filtered_analysis['prediction'] & intelligent_filter
-
-# On recalcule les métriques, en s 'assurant que zero_division n'est passé qu'aux fonctions qui le supportent.
-intelligent_metrics = {
-    "accuracy": accuracy_score(y_test, filtered_preds_intelligent),
-    "precision": precision_score(y_test, filtered_preds_intelligent, zero_division=0),
-    "recall": recall_score(y_test, filtered_preds_intelligent, zero_division=0),
-    "f1": f1_score(y_test, filtered_preds_intelligent, zero_division=0),
-}
-print("Nouvelles métriques avec filtre intelligent:", intelligent_metrics)
+print("\nNOTE: L'analyse d'erreur et les tests de filtres sont désactivés lors de l'utilisation de la validation croisée,")
+print("car ils nécessiteraient d'être effectués à l'intérieur de chaque pli pour être valides.")
 
 print("\nFini.")
