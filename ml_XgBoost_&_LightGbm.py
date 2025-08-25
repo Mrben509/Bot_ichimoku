@@ -1,6 +1,5 @@
 import os
 import json
-import pandas_ta as ta
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -62,6 +61,9 @@ for col in required_columns:
     if col not in df.columns:
         raise ValueError(f"Colonne manquante: {col}. Colonnes dispo: {list(df.columns)}")
 
+if 'ADX_14' not in df.columns:
+     raise ValueError("La colonne 'ADX_14' est maintenant requise pour la feature 'adx_trend_strength'. Veuillez mettre à jour votre fichier CSV.")
+
 # Tri temporel et sélection 1ère/dernière par ticket (comme ton script)
 df = df.sort_values('timeInput').reset_index(drop=True)
 # CORRECTIF CRITIQUE : Nous ne devons entraîner le modèle que sur les conditions au moment de l'entrée du trade.
@@ -116,6 +118,14 @@ df['adx_trend_strength'] = pd.cut(df['ADX_14'],
                                   labels=[0, 1, 2],  # 0: Pas de tendance, 1: Tendance faible, 2: Tendance forte
                                   right=False).astype(int)
 
+# --- FEATURES D'INTERACTION ---
+# On combine des signaux pour donner plus de contexte au modèle.
+# 1. Interaction entre la force du croisement et la force de la tendance ADX
+df['cross_x_adx'] = df['tk_cross_strength'] * (df['adx_trend_strength'] + 1)  # +1 pour éviter de multiplier par 0
+
+# 2. Interaction entre la position par rapport au Kijun et la stabilité du RSI
+df['kijun_x_rsi_stab'] = df['price_vs_kijun'] * df['rsi_stability']
+
 # Features temporelles
 df['hour_of_day'] = pd.to_datetime(df['timeInput']).dt.hour
 
@@ -124,8 +134,9 @@ FEATURES = ['type', 'rsiV', 'atrV', 'zScore50V',
             'risk_reward_ratio', 'ADX_14', 'cloud_thickness', 'tk_cross_signal',
             'tenkan_slope', 'kijun_slope', 'atr_relative', 'price_vs_kijun', 'dist_from_spanA',
             'dist_from_spanB', 'tk_cross_strength', 'tk_cross_stability', 'hour_of_day',
-            'rsi_stability', 'adx_trend_strength'] # Ajoute des nouvelles features de caractère
+            'rsi_stability', 'adx_trend_strength', 'cross_x_adx', 'kijun_x_rsi_stab'] # Ajoute des nouvelles features de caractère
 
+print(f"\nDataset initial: {len(df)} trades.")
 print("\nNettoyage des données après feature engineering...")
 # Les calculs (divisions, rolling means) peuvent créer des valeurs invalides (inf, NaN)
 # que XGBoost ne peut pas gérer.
@@ -218,7 +229,7 @@ def dump_conf_matrix(cm, labels=("Perdant","Gagnant")):
 # -------------------------------
 # 5) LightGBM
 # -------------------------------
-def train_lightgbm(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None) -> (EvalResult, Any):
+def optimize_lgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Dict:
     if not HAS_LGB:
         raise RuntimeError("LightGBM introuvable dans l'environnement.")
 # 1. Optimisation avec optuna
@@ -275,60 +286,14 @@ def train_lightgbm(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None
 
     print("\n[LightGBM] Recherche des hyperparamètres avec optuna…")
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective_lgb, n_trials=150)  # Argumenten_trials pour meilleure recherche
-
-    # 2. Entraînement final avec les meilleurs paramètres
-    print("\n[LightGBMEntraînement final avec les meilleurs paramètres…]")
-    best_params = study.best_params.copy()  # Copy pour évité de modifier l'objet de l'étude
-    best_params.update({
-        'objective': 'binary',
-        'metric': 'binary_logloss',
-        'verbosity': -1,
-        'seed': RANDOM_STATE,
-        'n_estimators': 5000
-    })
-
-    model = lgb.LGBMClassifier(**best_params)
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(200, verbose=False)])
-
-    # Probabilités validation & recherche seuil
-    val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val, min_trades_per_month=10)
-
-    # Sauvegarde
-    # NOTE: Dans un contexte de CV, on sauvegarde le modèle du dernier pli.
-    model_path_txt = os.path.join(OUTPUT_DIR, "lightgbm_model.txt")
-    model_path_joblib = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
-    model.booster_.save_model(model_path_txt)  # On garde le .txt pour référence
-    joblib.dump(model, model_path_joblib)   # On sauvegarde l'objet compler pour la conversion
-    print(f"[LightGBM] Modèle complet sauvegardé dans : {model_path_joblib}")
-    with open(os.path.join(OUTPUT_DIR, "best_threshold_lgb.json"), "w") as f:
-        json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_metric)}, f, indent=2)
-
-    # Évaluation sur le set de validation
-    metrics_val, _ = evaluate_threshold(y_val, val_prob, best_t)
-
-    # Importance des features
-    imp_gain = model.feature_importances_
-    imp_df = pd.DataFrame({'feature': FEATURES, 'gain': imp_gain})\
-              .sort_values('gain', ascending=False).reset_index(drop=True)
-    imp_df.to_csv(os.path.join(OUTPUT_DIR, 'lgb_feature_importance.csv'), index=False)
-
-    print(f"\n[LightGBM] Seuil optimal trouvé sur validation: {best_t:.2f} (Precision: {best_val_metric:.4f}))")
-
-    return EvalResult(
-        name="LightGBM",
-        threshold=best_t,
-        metrics_val=metrics_val,
-        metrics_test=None, # Sera rempli dans la boucle de CV
-        conf_matrix_test=None, # Sera rempli dans la boucle de CV
-        extra={"model_path": model_path_joblib}
-    ), model
+    study.optimize(objective_lgb, n_trials=100)  # Argumenten_trials pour meilleure recherche
+    print(f"Meilleurs paramètres trouvés pour LightGBM: {study.best_params}")
+    return study.best_params
 
 # -------------------------------
 # 6) XGBoost
 # -------------------------------
-def train_xgboost(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None) -> (EvalResult, Any):
+def optimize_xgb(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Dict:
     if not HAS_XGB:
         raise RuntimeError("XGBoost introuvable dans l'environnement.")
     def objective_xgb(trial):
@@ -361,71 +326,52 @@ def train_xgboost(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None)
 
     print("\n[XGBoost] Recherche des hyperparamètres avec Optuna…")
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective_xgb, n_trials=150)   # Augmenter le n_trials pour une meilleurs recherche
-
-    # 2. Entrainement final avec les meilleurs paramètres
-    print("\n[XGBoost] Entraînement final avec les meilleurs paramètres…")
-    best_params = study.best_params.copy()
-    # CORRECTIF CRITIQUE : Il faut rajouter les paramètres statiques qui ne sont pas optimisés par Optuna.
-    best_params.update({
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
-        'tree_method': 'hist',
-        'n_jobs': -1,
-        'random_state': RANDOM_STATE,
-    })
-
-    model = XGBClassifier(n_estimators=5000, early_stopping_rounds=200, **best_params)
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=False
-    )
-
-    # Probabilités validation & recherche seuil
-    val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_metric = search_best_threshold(y_val, val_prob, df_val, min_trades_per_month=10)
-
-    # Sauvegarde
-    model_path = os.path.join(OUTPUT_DIR, "xgb_model.json")
-    model.save_model(model_path)
-    with open(os.path.join(OUTPUT_DIR, "best_threshold_xgb.json"), "w") as f:
-        json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_metric)}, f, indent=2)
-
-    # Évaluation sur le set de validation
-    metrics_val, _ = evaluate_threshold(y_val, val_prob, best_t)
-
-    # Importance des features (gain)
-    booster = model.get_booster()
-    fmap = {f"f{i}": FEATURES[i] for i in range(len(FEATURES))}
-    score = booster.get_score(importance_type='gain')
-    imp_df = pd.DataFrame({
-        'feature': [fmap.get(k, k) for k in score.keys()],
-        'gain': list(score.values())
-    }).sort_values('gain', ascending=False).reset_index(drop=True)
-    imp_df.to_csv(os.path.join(OUTPUT_DIR, 'xgb_feature_importance.csv'), index=False)
-
-    print(f"\n[XGBoost] Seuil optimal trouvé sur validation: {best_t:.2f} (Precision : {best_val_metric:.4f})")
-
-    return EvalResult(
-        name="XGBoost",
-        threshold=best_t,
-        metrics_val=metrics_val,
-        metrics_test=None, # Sera remplit dans la boucle de CV
-        conf_matrix_test=None, # Sera rempli dans la boucle de CV
-        extra={"model_path": model_path}
-    ), model
+    study.optimize(objective_xgb, n_trials=100)   # Augmenter le n_trials pour une meilleurs recherche
+    print(f"Meilleurs paramètres trouvés pour XGBoost: {study.best_params}")
+    return study.best_params
 
 # -------------------------------
 # 7) Lancement: calcul du scale_pos_weight puis comparaison
 # -------------------------------
 
 N_SPLITS = 5  # Nombre de plis pour la validation croisée
+
+# --- PHASE 1: OPTIMISATION DES HYPERPARAMÈTRES (UNE SEULE FOIS) ---
+print("\n" + "=" * 20 + " PHASE 1: OPTIMISATION DES HYPERPARAMÈTRES " + "=" * 20)
+print("Utilisation du premier pli de validation pour trouver les meilleurs paramètres...")
+
+# On prend le premier pli pour créer un jeu d'entraînement/validation pour l'optimisation
+first_fold_tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+train_val_idx_optim, _ = next(iter(first_fold_tscv.split(X)))
+
+X_train_val_optim, y_train_val_optim = X[train_val_idx_optim], y[train_val_idx_optim]
+
+# On re-split ce premier pli en entraînement et validation pour Optuna
+val_size_optim = int(len(X_train_val_optim) * 0.25)  # 25% pour la validation
+train_size_optim = len(X_train_val_optim) - val_size_optim
+
+X_train_optim, y_train_optim = X_train_val_optim[:train_size_optim], y_train_val_optim[:train_size_optim]
+X_val_optim, y_val_optim = X_train_val_optim[train_size_optim:], y_train_val_optim[train_size_optim:]
+
+pos_optim = y_train_optim.sum()
+neg_optim = len(y_train_optim) - pos_optim
+scale_pos_optim = (neg_optim / pos_optim) if pos_optim > 0 else 1.0
+
+best_lgbm_params = {}
+if HAS_LGB:
+    best_lgbm_params = optimize_lgbm(X_train_optim, y_train_optim, X_val_optim, y_val_optim, scale_pos_optim)
+
+best_xgb_params = {}
+if HAS_XGB:
+    best_xgb_params = optimize_xgb(X_train_optim, y_train_optim, X_val_optim, y_val_optim, scale_pos_optim)
+
+# --- PHASE 2: VALIDATION CROISÉE AVEC LES MEILLEURS PARAMÈTRES ---
+print("\n" + "=" * 20 + " PHASE 2: VALIDATION CROISÉE " + "=" * 20)
+print("Évaluation des meilleurs paramètres sur tous les plis...")
+
 tscv = TimeSeriesSplit(n_splits=N_SPLITS)
 
 all_results = []
-
-print(f"\nLancement de la validation croisée temporelle avec {N_SPLITS} plis...")
 
 for fold, (train_val_index, test_index) in enumerate(tscv.split(X)):
     print(f"\n{'=' * 20} FOLD {fold + 1}/{N_SPLITS} {'=' * 20}")
@@ -456,8 +402,46 @@ for fold, (train_val_index, test_index) in enumerate(tscv.split(X)):
     # 4. Entraîner les modèles sur ce pli
     if HAS_LGB:
         try:
-            res_lgb, model_lgb = train_lightgbm(X_train, y_train, X_val, y_val, df_val,
-                                                scale_pos_weight=scale_pos)
+            print("\n[LightGBM] Entraînement et évaluation...")
+            lgbm_params = best_lgbm_params.copy()
+            lgbm_params.update({
+                'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
+                'seed': RANDOM_STATE, 'n_estimators': 5000
+            })
+            if 'scale_pos_weight' not in lgbm_params:  # Si Optuna ne l'a pas optimisé, on utilise celui du pli
+                lgbm_params['scale_pos_weight'] = scale_pos
+
+            model_lgb = lgb.LGBMClassifier(**lgbm_params)
+            model_lgb.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+                          callbacks=[lgb.early_stopping(200, verbose=False)])
+
+            val_prob_lgb = model_lgb.predict_proba(X_val)[:, 1]
+            best_t_lgb, best_val_metric_lgb = search_best_threshold(y_val, val_prob_lgb, df_val,
+                                                                    min_trades_per_month=10)
+            metrics_val_lgb, _ = evaluate_threshold(y_val, val_prob_lgb, best_t_lgb)
+            print(
+                f"[LightGBM] Seuil optimal trouvé sur validation: {best_t_lgb:.2f} (Precision: {best_val_metric_lgb:.4f})")
+
+            # Sauvegarde du modèle et du seuil (uniquement pour le dernier pli)
+            if fold == N_SPLITS - 1:
+                model_path_joblib = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
+                joblib.dump(model_lgb, model_path_joblib)
+                print(f"[LightGBM] Modèle final sauvegardé dans : {model_path_joblib}")
+                with open(os.path.join(OUTPUT_DIR, "best_threshold_lgb.json"), "w") as f:
+                    json.dump({"threshold": float(best_t_lgb)}, f, indent=2)
+                # Sauvegarde de l'importance des features du dernier pli
+                imp_gain = model_lgb.feature_importances_
+                imp_df = pd.DataFrame({'feature': FEATURES, 'gain': imp_gain}).sort_values('gain', ascending=False)
+                imp_df.to_csv(os.path.join(OUTPUT_DIR, 'lgb_feature_importance.csv'), index=False)
+
+            res_lgb = EvalResult(
+                name="LightGBM",
+                threshold=best_t_lgb,
+                metrics_val=metrics_val_lgb,
+                metrics_test={},
+                conf_matrix_test=None,
+                extra={}
+            )
 
             # Évaluation sur le jeu de test du pli
             test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
@@ -474,8 +458,48 @@ for fold, (train_val_index, test_index) in enumerate(tscv.split(X)):
 
     if HAS_XGB:
         try:
-            res_xgb, model_xgb = train_xgboost(X_train, y_train, X_val, y_val, df_val,
-                                               scale_pos_weight=scale_pos)
+            print("\n[XGBoost] Entraînement et évaluation...")
+            xgb_params = best_xgb_params.copy()
+            xgb_params.update({
+                'objective': 'binary:logistic', 'eval_metric': 'logloss', 'tree_method': 'hist',
+                'n_jobs': -1, 'random_state': RANDOM_STATE
+            })
+            if 'scale_pos_weight' not in xgb_params:
+                xgb_params['scale_pos_weight'] = scale_pos
+
+            model_xgb = XGBClassifier(n_estimators=5000, early_stopping_rounds=200, **xgb_params)
+            model_xgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+            val_prob_xgb = model_xgb.predict_proba(X_val)[:, 1]
+            best_t_xgb, best_val_metric_xgb = search_best_threshold(y_val, val_prob_xgb, df_val,
+                                                                    min_trades_per_month=10)
+            metrics_val_xgb, _ = evaluate_threshold(y_val, val_prob_xgb, best_t_xgb)
+            print(
+                f"[XGBoost] Seuil optimal trouvé sur validation: {best_t_xgb:.2f} (Precision: {best_val_metric_xgb:.4f})")
+
+            # Sauvegarde du modèle et du seuil (uniquement pour le dernier pli)
+            if fold == N_SPLITS - 1:
+                model_path_json = os.path.join(OUTPUT_DIR, "xgb_model.json")
+                model_xgb.save_model(model_path_json)
+                print(f"[XGBoost] Modèle final sauvegardé dans : {model_path_json}")
+                with open(os.path.join(OUTPUT_DIR, "best_threshold_xgb.json"), "w") as f:
+                    json.dump({"threshold": float(best_t_xgb)}, f, indent=2)
+                # Sauvegarde de l'importance des features du dernier pli
+                score = model_xgb.get_booster().get_score(importance_type='gain')
+                fmap = {f"f{i}": FEATURES[i] for i in range(len(FEATURES))}
+                imp_df = pd.DataFrame(
+                    {'feature': [fmap.get(k, k) for k in score.keys()], 'gain': list(score.values())}).sort_values(
+                    'gain', ascending=False)
+                imp_df.to_csv(os.path.join(OUTPUT_DIR, 'xgb_feature_importance.csv'), index=False)
+
+            res_xgb = EvalResult(
+                name="XGBoost",
+                threshold=best_t_xgb,
+                metrics_val=metrics_val_xgb,
+                metrics_test={},
+                conf_matrix_test=None,
+                extra={}
+            )
 
             # Évaluation sur le jeu de test du pli
             test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
@@ -555,11 +579,13 @@ if not aggregated_results:
 # On définit un score combiné pour équilibrer le F1-score et le winrate (précision).
 # Un F1 élevé est bien, mais un winrate élevé est crucial pour la rentabilité et la psychologie du trading.
 # Vous pouvez ajuster les poids (ex: 0.5/0.5 si vous voulez un poids égal).
-def combined_score(res: EvalResult, f1_weight=0.6, precision_weight=0.4) -> float:
-    f1 = res.metrics_test.get("f1", 0)
-    precision = res.metrics_test.get("precision", 0)  # Le winrate
-    score = f1_weight * f1 + precision_weight * precision
-    print(f"Score combiné pour {res.name:<25}: {score:.4f} (F1: {f1:.2f}, Precision: {precision:.2f})")
+# On définit un score combiné pour équilibrer le F1-score et le winrate (précision).
+# Un F1 élevé est bien, mais un winrate élevé est crucial pour la rentabilité et la psychologie du trading.
+# Vous pouvez ajuster les poids (ex: 0.5/0.5 si vous voulez un poids égal).
+def combined_score(res: EvalResult) -> float:
+    # On sélectionne maintenant le modèle basé uniquement sur son score AUC moyen.
+    score = res.metrics_test.get("auc", 0)
+    print(f"Score de sélection pour {res.name:<25}: {score:.4f} (Critère: AUC)")
     return score
 
 
