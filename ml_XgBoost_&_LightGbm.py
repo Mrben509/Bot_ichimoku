@@ -64,9 +64,9 @@ for col in required_columns:
 
 # Tri temporel et sélection 1ère/dernière par ticket (comme ton script)
 df = df.sort_values('timeInput').reset_index(drop=True)
-first_entries = df.groupby('ticket', as_index=False).head(1)
-last_entries = df.groupby('ticket', as_index=False).tail(1)
-df = pd.concat([first_entries, last_entries]).drop_duplicates().reset_index(drop=True)
+# CORRECTIF CRITIQUE : Nous ne devons entraîner le modèle que sur les conditions au moment de l'entrée du trade.
+df = df.groupby('ticket', as_index=False).head(1).reset_index(drop=True)
+
 
 # Feature engineering identique
 df['distance_to_sl_art'] = (df['price'] - df['sl']) / df['atrV']
