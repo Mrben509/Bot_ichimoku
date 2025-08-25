@@ -106,17 +106,25 @@ df['tk_cross_strength'] = df['tk_cross_signal'] * df['tenkan_slope'].abs()
 # Compte le nombre de périodes consécutives où le signal de croisement n'a pas changé.
 df['tk_cross_stability'] = df['tk_cross_signal'].rolling(window=5).apply(lambda x: (x == x.iloc[-1]).sum()).fillna(0)
 
+# --- NOUVELLES FEATURES DE CARACTÈRE DE MARCHÉ ---
+# 1. Stabilité du RSI: Un RSI stable est souvent plus significatif qu'un RSI qui oscille sauvagement.
+df['rsi_stability'] = df['rsiV'].rolling(14).std()
+
+# 2. Force de la tendance ADX: Catégoriser la force de la tendance peut aider le modèle à mieux interpréter les autres signaux.
+df['adx_trend_strength'] = pd.cut(df['ADX_14'],
+                                  bins=[0, 20, 25, 100],
+                                  labels=[0, 1, 2],  # 0: Pas de tendance, 1: Tendance faible, 2: Tendance forte
+                                  right=False).astype(int)
+
 # Features temporelles
 df['hour_of_day'] = pd.to_datetime(df['timeInput']).dt.hour
 
-FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
-            'price', 'distPriceToCloud', 'distKijunToCloud', 'volume', 'sl', 'tp',
-            'slope5V', 'slope10V', 'slope20V',
-            'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
+FEATURES = ['type', 'rsiV', 'atrV', 'zScore50V',
             'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
-            'risk_reward_ratio', 'ADX_14', 'DMP_14', 'DMN_14', 'cloud_thickness', 'tk_cross_signal',
+            'risk_reward_ratio', 'ADX_14', 'cloud_thickness', 'tk_cross_signal',
             'tenkan_slope', 'kijun_slope', 'atr_relative', 'price_vs_kijun', 'dist_from_spanA',
-            'dist_from_spanB', 'tk_cross_strength', 'tk_cross_stability', 'hour_of_day'] # On ajoute les colonnes de l'ADX
+            'dist_from_spanB', 'tk_cross_strength', 'tk_cross_stability', 'hour_of_day',
+            'rsi_stability', 'adx_trend_strength'] # Ajoute des nouvelles features de caractère
 
 print("\nNettoyage des données après feature engineering...")
 # Les calculs (divisions, rolling means) peuvent créer des valeurs invalides (inf, NaN)
@@ -235,11 +243,11 @@ def train_lightgbm(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None
             'learning_rate': trial.suggest_float(  # Learning rate
                 'learning_rate', 0.01, 0.1, log=True),
             'num_leaves': trial.suggest_int(  # Number of leaves
-                'num_leaves', 20, 150),
+                'num_leaves', 20, 80),
             'max_depth': trial.suggest_int(  # Maximum tree depth
-                'max_depth', 3, 12),
+                'max_depth', 3, 7),
             'min_child_samples': trial.suggest_int(  # Minimum number of samples
-                'min_child_samples', 5, 100),
+                'min_child_samples', 20, 100),
             'feature_fraction': trial.suggest_float(  # Fraction of features
                 'feature_fraction', 0.6, 1.0),
             'bagging_fraction': trial.suggest_float(  # Bagging fraction
@@ -331,12 +339,12 @@ def train_xgboost(X_train, y_train, X_val, y_val, df_val, scale_pos_weight=None)
             'n_jobs' : -1,
             'random_state' : RANDOM_STATE,
             'learning_rate' : trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'max_depth' : trial.suggest_int('max_depth', 3, 10),
+            'max_depth' : trial.suggest_int('max_depth', 3, 7),
             'subsample' : trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree' : trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'reg_lambda' : trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
             'reg_alpha' : trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-            'min_child_weight' : trial.suggest_int('min_child_weight', 1, 10),
+            'min_child_weight' : trial.suggest_int('min_child_weight', 5, 10),
 
         }
         # On laisse Optuna trouver le meilleur poids pour les classes
