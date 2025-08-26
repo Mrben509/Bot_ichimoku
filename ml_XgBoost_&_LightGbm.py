@@ -589,9 +589,80 @@ def combined_score(res: EvalResult) -> float:
     return score
 
 
-print("\nSélection du meilleur modèle basée sur un score combiné (F1-score + Winrate)...")
+print("\nSélection du meilleur modèle basée sur le critère dèfini (AUC moyen)...")
 aggregated_results_sorted = sorted(aggregated_results, key=combined_score, reverse=True)
 best = aggregated_results_sorted[0]
+
+# --- PHASE 3: RÉ-ENTRAÎNEMENT DU MODÈLE FINAL POUR LE BACKTESTING ---
+print("\n" + "=" * 20 + " PHASE 3: RÉ-ENTRAÎNEMENT DU MODÈLE FINAL " + "=" * 20)
+print(f"Le meilleur type de modèle est '{best.name}'. Ré-entraînement sur 100% des données pour le backtesting...")
+
+if "Ensemble" in best.name:
+    print("Le modèle Ensemble ne peut pas être ré-entraîné directement. Veuillez utiliser les modèles individuels.")
+else:
+    # Utiliser les données complètes
+    X_full, y_full = X, y
+
+    # Pour l'early stopping, on utilise les 10% de données les plus récentes comme validation
+    split_point = int(len(X_full) * 0.9)
+    X_train_final, y_train_final = X_full[:split_point], y_full[:split_point]
+    X_val_final, y_val_final = X_full[split_point:], y_full[split_point:]
+    df_val_final = df.iloc[split_point:]
+
+    print(
+        f"Ré-entraînement sur {len(X_train_final)} échantillons, validation pour early stopping sur {len(X_val_final)}.")
+
+    # Utiliser les hyperparamètres optimisés lors de la Phase 1
+    if best.name == "LightGBM" and HAS_LGB:
+        final_params = best_lgbm_params.copy()
+        final_params.update({
+            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
+            'seed': RANDOM_STATE, 'n_estimators': 5000
+        })
+        pos_full = y_train_final.sum()
+        neg_full = len(y_train_final) - pos_full
+        final_params['scale_pos_weight'] = (neg_full / pos_full) if pos_full > 0 else 1.0
+
+        final_model = lgb.LGBMClassifier(**final_params)
+        final_model.fit(X_train_final, y_train_final, eval_set=[(X_val_final, y_val_final)],
+                        callbacks=[lgb.early_stopping(200, verbose=False)])
+
+        # Trouver le meilleur seuil pour ce modèle final
+        final_val_prob = final_model.predict_proba(X_val_final)[:, 1]
+        final_threshold, _ = search_best_threshold(y_val_final, final_val_prob, df_val_final, min_trades_per_month=10)
+
+        # Sauvegarde du modèle final ET de son seuil
+        final_model_path = os.path.join(OUTPUT_DIR, "final_model_lgbm.joblib")
+        final_threshold_path = os.path.join(OUTPUT_DIR, "final_threshold_lgbm.json")
+        joblib.dump(final_model, final_model_path)
+        with open(final_threshold_path, "w") as f:
+            json.dump({"threshold": float(final_threshold)}, f, indent=2)
+        print(f"Modèle final pour backtest sauvegardé dans : {final_model_path}")
+        print(f"Seuil final pour backtest sauvegardé dans : {final_threshold_path} (Seuil: {final_threshold:.4f})")
+
+    elif best.name == "XGBoost" and HAS_XGB:
+        final_params = best_xgb_params.copy()
+        final_params.update({
+            'objective': 'binary:logistic', 'eval_metric': 'logloss', 'tree_method': 'hist',
+            'n_jobs': -1, 'random_state': RANDOM_STATE
+        })
+        pos_full = y_train_final.sum()
+        neg_full = len(y_train_final) - pos_full
+        final_params['scale_pos_weight'] = (neg_full / pos_full) if pos_full > 0 else 1.0
+
+        final_model = XGBClassifier(n_estimators=5000, early_stopping_rounds=200, **final_params)
+        final_model.fit(X_train_final, y_train_final, eval_set=[(X_val_final, y_val_final)], verbose=False)
+
+        final_val_prob = final_model.predict_proba(X_val_final)[:, 1]
+        final_threshold, _ = search_best_threshold(y_val_final, final_val_prob, df_val_final, min_trades_per_month=10)
+
+        final_model_path = os.path.join(OUTPUT_DIR, "final_model_xgb.json")
+        final_threshold_path = os.path.join(OUTPUT_DIR, "final_threshold_xgb.json")
+        final_model.save_model(final_model_path)
+        with open(final_threshold_path, "w") as f:
+            json.dump({"threshold": float(final_threshold)}, f, indent=2)
+        print(f"Modèle final pour backtest sauvegardé dans : {final_model_path}")
+        print(f"Seuil final pour backtest sauvegardé dans : {final_threshold_path} (Seuil: {final_threshold:.4f})")
 
 print("\n========================")
 print("Meilleur modèle:", best.name)
