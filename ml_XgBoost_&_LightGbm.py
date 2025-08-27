@@ -516,29 +516,34 @@ for fold, (train_val_index, test_index) in enumerate(tscv.split(X)):
 
     # 5. Créer l'ensemble pour ce pli
     if 'LightGBM' in fold_models and 'XGBoost' in fold_models:
-        print("\n[Ensemble] Création et évaluation de l'ensemble (Filtre à deux étages)...")
+        print("\n[Ensemble] Création et évaluation de l'ensemble (Moyenne des probabilités)...")
         model_lgb = fold_models['LightGBM']
         model_xgb = fold_models['XGBoost']
-        res_lgb = next(r for r in fold_results_list if r.name == "LightGBM")
-        res_xgb = next(r for r in fold_results_list if r.name == "XGBoost")
-
-        test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
-        preds_xgb = (test_prob_xgb >= res_xgb.threshold).astype(int)
+        # Obtenir les probabilités sur les jeux de validation et de test
+        val_prob_lgb = model_lgb.predict_proba(X_val)[:, 1]
+        val_prob_xgb = model_xgb.predict_proba(X_val)[:, 1]
         test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
-        preds_lgb = (test_prob_lgb >= res_lgb.threshold).astype(int)
-        ensemble_preds = preds_xgb & preds_lgb
+        test_prob_xgb = model_xgb.predict_proba(X_test)[:, 1]
 
-        metrics_test_ensemble = {
-            "accuracy": accuracy_score(y_test, ensemble_preds),
-            "precision": precision_score(y_test, ensemble_preds, zero_division=0),
-            "recall": recall_score(y_test, ensemble_preds, zero_division=0),
-            "f1": f1_score(y_test, ensemble_preds, zero_division=0),
-        }
-        cm_test_ensemble = confusion_matrix(y_test, ensemble_preds)
+        # Créer les probabilités de l'ensemble en moyennant
+        ensemble_val_prob = (val_prob_lgb + val_prob_xgb) / 2.0
+        ensemble_test_prob = (test_prob_lgb + test_prob_xgb) / 2.0
+
+        # Chercher le meilleur seuil pour l'ensemble sur le jeu de validation
+        best_t_ensemble, best_val_metric_ensemble = search_best_threshold(y_val, ensemble_val_prob, df_val,
+                                                                          min_trades_per_month=10)
+        print(
+            f"[Ensemble] Seuil optimal trouvé sur validation: {best_t_ensemble:.2f} (Precision: {best_val_metric_ensemble:.4f})")
+
+        # Évaluer l'ensemble sur le jeu de test avec son propre seuil
+        metrics_test_ensemble, y_pred_test_ensemble = evaluate_threshold(y_test, ensemble_test_prob,
+                                                                         best_t_ensemble)
+        cm_test_ensemble = confusion_matrix(y_test, y_pred_test_ensemble)
+
 
         ensemble_result = EvalResult(
-            name="Ensemble (XGB--->LGB Filter)",
-            threshold=np.nan, metrics_val={},
+            name="Ensemble (Moyenne)",
+            threshold=best_t_ensemble, metrics_val={},
             metrics_test=metrics_test_ensemble,
             conf_matrix_test=cm_test_ensemble, extra={}
         )
@@ -575,29 +580,42 @@ if not aggregated_results:
 # -------------------------------
 # 8) Sélection du meilleur modèle (F1 sur validation), évaluation test détaillée
 # -------------------------------
-# --- NOUVELLE LOGIQUE DE SÉLECTION ---
-# On définit un score combiné pour équilibrer le F1-score et le winrate (précision).
-# Un F1 élevé est bien, mais un winrate élevé est crucial pour la rentabilité et la psychologie du trading.
-# Vous pouvez ajuster les poids (ex: 0.5/0.5 si vous voulez un poids égal).
-# On définit un score combiné pour équilibrer le F1-score et le winrate (précision).
-# Un F1 élevé est bien, mais un winrate élevé est crucial pour la rentabilité et la psychologie du trading.
-# Vous pouvez ajuster les poids (ex: 0.5/0.5 si vous voulez un poids égal).
-def combined_score(res: EvalResult) -> float:
-    # On sélectionne maintenant le modèle basé uniquement sur son score AUC moyen.
-    score = res.metrics_test.get("auc", 0)
-    print(f"Score de sélection pour {res.name:<25}: {score:.4f} (Critère: AUC)")
-    return score
+# --- NOUVELLE LOGIQUE DE SÉLECTION : Basée sur le MEILLEUR AUC unique ---
+# --- NOUVELLE LOGIQUE DE SÉLECTION : Basée sur le MEILLEUR AUC unique avec condition sur le recall ---
+print("\nSélection du meilleur modèle basée sur le plus haut score AUC atteint sur un seul pli...")
+print("Condition: Le recall doit être inférieur à 1.0 pour éviter les modèles dégénérés.")
+print("NOTE: Cette méthode récompense la performance de pointe mais est moins robuste que la moyenne.")
 
 
-print("\nSélection du meilleur modèle basée sur le critère dèfini (AUC moyen)...")
-aggregated_results_sorted = sorted(aggregated_results, key=combined_score, reverse=True)
-best = aggregated_results_sorted[0]
+if not all_results:
+    raise SystemExit("Aucun résultat à évaluer. L'entraînement a probablement échoué.")
+
+    # On filtre les résultats où le recall est de 1.0, car ils indiquent un modèle qui prédit '1' pour tout.
+valid_results = [r for r in all_results if r.metrics_test.get("recall", 0) < 1.0]
+
+if not valid_results:
+    print(
+        "\nAVERTISSEMENT : Tous les modèles ont un recall de 1.0. Aucun modèle valide n'a été trouvé selon les critères.")
+    print(
+        "Cela indique un problème systémique (peut-être des features qui fuient de l'information ou un déséquilibre extrême).")
+    print("Le script va s'arrêter. Veuillez analyser les résultats des plis.")
+    raise SystemExit("Aucun modèle non-dégénéré trouvé.")
+
+# On trie les résultats valides par leur score AUC
+all_results_sorted_by_peak_auc = sorted(valid_results, key=lambda r: r.metrics_test.get("auc", 0), reverse=True)
+
+# Le meilleur est le premier de la liste
+best_single_run = all_results_sorted_by_peak_auc[0]
+best_model_type = best_single_run.name
+
+print(
+    f"Le meilleur run individuel a été obtenu par '{best_single_run.name}' avec un AUC de {best_single_run.metrics_test.get('auc', 0):.4f} et un Recall de {best_single_run.metrics_test.get('recall', 0):.4f}.")
 
 # --- PHASE 3: RÉ-ENTRAÎNEMENT DU MODÈLE FINAL POUR LE BACKTESTING ---
 print("\n" + "=" * 20 + " PHASE 3: RÉ-ENTRAÎNEMENT DU MODÈLE FINAL " + "=" * 20)
-print(f"Le meilleur type de modèle est '{best.name}'. Ré-entraînement sur 100% des données pour le backtesting...")
+print(f"Le meilleur type de modèle est '{best_model_type}'. Ré-entraînement sur 100% des données pour le backtesting...")
 
-if "Ensemble" in best.name:
+if "Ensemble" in best_model_type:
     print("Le modèle Ensemble ne peut pas être ré-entraîné directement. Veuillez utiliser les modèles individuels.")
 else:
     # Utiliser les données complètes
@@ -613,7 +631,7 @@ else:
         f"Ré-entraînement sur {len(X_train_final)} échantillons, validation pour early stopping sur {len(X_val_final)}.")
 
     # Utiliser les hyperparamètres optimisés lors de la Phase 1
-    if best.name == "LightGBM" and HAS_LGB:
+    if best_model_type == "LightGBM" and HAS_LGB:
         final_params = best_lgbm_params.copy()
         final_params.update({
             'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
@@ -640,7 +658,7 @@ else:
         print(f"Modèle final pour backtest sauvegardé dans : {final_model_path}")
         print(f"Seuil final pour backtest sauvegardé dans : {final_threshold_path} (Seuil: {final_threshold:.4f})")
 
-    elif best.name == "XGBoost" and HAS_XGB:
+    elif best_model_type == "XGBoost" and HAS_XGB:
         final_params = best_xgb_params.copy()
         final_params.update({
             'objective': 'binary:logistic', 'eval_metric': 'logloss', 'tree_method': 'hist',
@@ -665,9 +683,9 @@ else:
         print(f"Seuil final pour backtest sauvegardé dans : {final_threshold_path} (Seuil: {final_threshold:.4f})")
 
 print("\n========================")
-print("Meilleur modèle:", best.name)
-print("\nPerformance moyenne sur les plis de test:")
-for k, v in best.metrics_test.items():
+print(f"Meilleur modèle (basé sur le pic AUC): {best_single_run.name}")
+print("\nPerformance de ce run spécifique:")
+for k, v in best_single_run.metrics_test.items():
     print(f" - {k:<10}: {v:.4f}")
 print("========================\n")
 
@@ -677,10 +695,10 @@ print("========================\n")
  # Le résumé ici est basé sur les performances moyennes de la CV.
 
 summary = {
-    "best_model": best.name,
+    "best_model": best_single_run.name,
     "threshold": "N/A (Cross-Validation)", # Un seuil unique n'a pas de sens ici
     "val_metrics": {},
-    "test_metrics": {k: float(v) for k, v in best.metrics_test.items()},
+    "test_metrics": {k: float(v) for k, v in best_single_run.metrics_test.items()},
 }
 with open(os.path.join(OUTPUT_DIR, "summary_boosting.json"), "w") as f:
     json.dump(summary, f, indent=2)
@@ -689,18 +707,18 @@ with open(os.path.join(OUTPUT_DIR, "summary_boosting.json"), "w") as f:
 # 9) (Optionnel) Affichage matrice de confusion du meilleur modèle
 # -------------------------------
 try:
-    if best.conf_matrix_test is None:
+    if best_single_run.conf_matrix_test is None:
         print("\nPas de matrice de confusion à afficher pour les résultats agrégés.")
     else:
         import seaborn as sns
-        cm = best.conf_matrix_test
+        cm = best_single_run.conf_matrix_test
         plt.figure(figsize=(6,5))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                     xticklabels=['Perdant','Gagnant'], yticklabels=['Perdant','Gagnant'])
-        plt.title(f"Matrice de confusion – {best.name}")
+        plt.title(f"Matrice de confusion – {best_single_run.name}")
         plt.xlabel('Prédit')
         plt.ylabel('Vrai')
-        fig_path = os.path.join(OUTPUT_DIR, f"cm_{best.name.lower()}.png")
+        fig_path = os.path.join(OUTPUT_DIR, f"cm_{best_single_run.name.lower()}.png")
         plt.tight_layout()
         plt.savefig(fig_path, dpi=130)
         plt.close() # Important pour fermer la figure et ne pas bloquer le script
