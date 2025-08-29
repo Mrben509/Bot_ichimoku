@@ -2,7 +2,6 @@
 import os
 import json
 import sys
-import numpy as np
 
 # --- Vérification et importation des bibliothèques ---
 # On s'assure que les outils nécessaires sont installés et on guide l'utilisateur si ce n'est pas le cas.
@@ -24,14 +23,12 @@ SUMMARY_PATH = os.path.join(OUTPUT_DIR, "summary_boosting.json")
 
 # IMPORTANT : Cette liste de features doit correspondre EXACTEMENT à celle
 # utilisée dans votre script d'entraînement `ml_XgBoost_&_LightGbm.py`.
-FEATURES = [
-    'type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
-    'price', 'distPriceToCloud', 'distKijunToCloud', 'volume', 'sl', 'tp',
-    'slope5V', 'slope10V', 'slope20V',
-    'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
-    'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
-    'sl_size_in_atr'
-]
+FEATURES = ['type', 'rsiV', 'atrV', 'zScore50V',
+            'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
+            'risk_reward_ratio', 'ADX_14', 'cloud_thickness', 'tk_cross_signal',
+            'tenkan_slope', 'kijun_slope', 'atr_relative', 'price_vs_kijun', 'dist_from_spanA',
+            'dist_from_spanB', 'tk_cross_strength', 'tk_cross_stability', 'hour_of_day',
+            'rsi_stability', 'adx_trend_strength', 'cross_x_adx', 'kijun_x_rsi_stab']
 
 # --- 2. Lire le résumé pour identifier le meilleur modèle ---
 print("Lecture du fichier de résumé pour trouver le meilleur modèle...")
@@ -44,54 +41,57 @@ except FileNotFoundError:
     sys.exit(1)
 
 best_model_name = summary.get('best_model')
-best_threshold = summary.get('threshold')
 
-if not best_model_name or best_threshold is None:
-    print("ERREUR: Le fichier résumé est incomplet ou corrompu. Il manque 'best_model' ou 'threshold'.")
-    sys.exit(1)
+try:
+    if "LightGBM" in best_model_name:
+        model_file = os.path.join(OUTPUT_DIR, "final_model_lgbm.joblib")
+        threshold_file = os.path.join(OUTPUT_DIR, "final_threshold_lgbm.json")
+        model_type = "lightgbm"
+        print(f"Chargement du modèle depuis : {model_file}")
+        model_to_convert = joblib.load(model_file)
 
-# --- 3. Charger le modèle correspondant ---
-model_file = ""
-model_type = ""
-model_to_convert = None
+    elif "XGBoost" in best_model_name:
+        model_file = os.path.join(OUTPUT_DIR, "final_model_xgb.json")
+        threshold_file = os.path.join(OUTPUT_DIR, "final_threshold_xgb.json")
+        model_type = "xgboost"
+        print(f"Chargement du modèle depuis : {model_file}")
+        model_to_convert = xgb.XGBClassifier()
+        model_to_convert.load_model(model_file)
 
-print(f"Le meilleur modèle identifié est : '{best_model_name}'")
+        # m2cgen attend un float pour base_score, mais il peut être chargé comme une chaîne.
+        if hasattr(model_to_convert, 'base_score') and isinstance(model_to_convert.base_score, str):
+            print(
+                f"AVERTISSEMENT: Le 'base_score' du modèle XGBoost est une chaîne ('{model_to_convert.base_score}'). Conversion en float.")
+            try:
+                model_to_convert.base_score = float(model_to_convert.base_score)
+            except (ValueError, TypeError):
+                print("ERREUR: Impossible de convertir 'base_score' en float. Le modèle est peut-être corrompu.")
+                sys.exit(1)
+    else:
+        # On ne gère pas l'ensemble pour la conversion directe.
+        print(f"AVERTISSEMENT: Le modèle '{best_model_name}' n'est pas directement convertible.")
+        print("La conversion ne fonctionne que pour 'LightGBM' ou 'XGBoost' de base.")
+        sys.exit(1)
 
-if "LightGBM" in best_model_name:
-    model_file = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
-    model_type = "lightgbm"
-
-
-    model_to_convert = joblib.load(model_file)
-
-elif "XGBoost" in best_model_name:
-    model_file = os.path.join(OUTPUT_DIR, "xgb_model.json")
-    model_type = "xgboost"
-    # Pour XGBoost, il est préférable de charger l'objet modèle
-    model_to_convert = xgb.XGBClassifier()
-    model_to_convert.load_model(model_file)
-
-    # CORRECTIF : m2cgen attend un float pour base_score, mais il peut être chargé comme une chaîne.
-    # On s'assure qu'il est bien de type float avant la conversion.
-    if hasattr(model_to_convert, 'base_score') and isinstance(model_to_convert.base_score, str):
-        print(
-            f"AVERTISSEMENT: Le 'base_score' du modèle XGBoost est une chaîne ('{model_to_convert.base_score}'). Conversion en float.")
-        try:
-            model_to_convert.base_score = float(model_to_convert.base_score)
-        except (ValueError, TypeError):
-            print("ERREUR: Impossible de convertir 'base_score' en float. Le modèle est peut-être corrompu.")
-            sys.exit(1)
-
-else:
-    # On ne gère pas l'ensemble pour la conversion directe, car cela nécessiterait
-    # de convertir les deux modèles et de combiner leur logique en MQL5.
-    # On se concentre sur la conversion du meilleur modèle de base.
-    print(f"AVERTISSEMENT: Le modèle '{best_model_name}' n'est pas directement convertible.")
-    print("La conversion ne fonctionne que pour 'LightGBM' ou 'XGBoost' de base.")
-    sys.exit(1)
-
-if not os.path.exists(model_file):
+except FileNotFoundError:
     print(f"ERREUR: Fichier modèle introuvable : '{model_file}'")
+    print("Assurez-vous que la phase de ré-entraînement (Phase 3) du script principal a bien été exécutée.")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERREUR: Une erreur inattendue est survenue lors du chargement du modèle : {e}")
+    sys.exit(1)
+
+    # Charger le seuil depuis son fichier dédié pour plus de robustesse
+try:
+    with open(threshold_file, 'r') as f:
+        threshold_data = json.load(f)
+        best_threshold = threshold_data.get('threshold')
+    if best_threshold is None:
+        raise KeyError("La clé 'threshold' est manquante dans le fichier.")
+    print(f"Seuil chargé depuis '{threshold_file}': {best_threshold:.4f}")
+except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
+    print(f"ERREUR: Fichier seuil '{threshold_file}' introuvable ou invalide. Erreur: {e}")
+    print("Assurez-vous que la phase de ré-entraînement (Phase 3) du script principal a bien été exécutée.")
     sys.exit(1)
 
 # --- 4. Générer le code C avec m2cgen ---
