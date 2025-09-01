@@ -1,4 +1,3 @@
 {
-  "threshold": 0.32,
-  "best_val_f1": 0.6131386861313869
+  "threshold": 0.5
 }
