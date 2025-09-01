@@ -129,12 +129,16 @@ df['kijun_x_rsi_stab'] = df['price_vs_kijun'] * df['rsi_stability']
 # Features temporelles
 df['hour_of_day'] = pd.to_datetime(df['timeInput']).dt.hour
 
-FEATURES = ['type', 'rsiV', 'atrV', 'zScore50V',
+# --- NOUVELLE FEATURE : Taille du Stop Loss en ATR ---
+# Mesure la taille du stop loss par rapport à la volatilité actuelle.
+df['sl_size_in_atr'] = (df['price'] - df['sl']).abs() / df['atrV'].replace(0, np.nan)
+
+
+FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging', 'price',
+            'distPriceToCloud', 'distKijunToCloud', 'volume', 'sl', 'tp', 'slope5V', 'slope10V', 'slope20V',
+            'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
             'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
-            'risk_reward_ratio', 'ADX_14', 'cloud_thickness', 'tk_cross_signal',
-            'tenkan_slope', 'kijun_slope', 'atr_relative', 'price_vs_kijun', 'dist_from_spanA',
-            'dist_from_spanB', 'tk_cross_strength', 'tk_cross_stability', 'hour_of_day',
-            'rsi_stability', 'adx_trend_strength', 'cross_x_adx', 'kijun_x_rsi_stab'] # Ajoute des nouvelles features de caractère
+            'sl_size_in_atr'] # Ajoute des nouvelles features de caractère
 
 print(f"\nDataset initial: {len(df)} trades.")
 print("\nNettoyage des données après feature engineering...")
@@ -580,9 +584,8 @@ if not aggregated_results:
 # -------------------------------
 # 8) Sélection du meilleur modèle (F1 sur validation), évaluation test détaillée
 # -------------------------------
-# --- NOUVELLE LOGIQUE DE SÉLECTION : Basée sur le MEILLEUR AUC unique ---
-# --- NOUVELLE LOGIQUE DE SÉLECTION : Basée sur le MEILLEUR AUC unique avec condition sur le recall ---
-print("\nSélection du meilleur modèle basée sur le plus haut score AUC atteint sur un seul pli...")
+# --- NOUVELLE LOGIQUE DE SÉLECTION : Score combiné AUC et précision ---
+print("\nSélection du meilleur modèle basée sur un score combiné AUC et précision sur un seul pli...")
 print("Condition: Le recall doit être inférieur à 1.0 pour éviter les modèles dégénérés.")
 print("NOTE: Cette méthode récompense la performance de pointe mais est moins robuste que la moyenne.")
 
@@ -590,26 +593,32 @@ print("NOTE: Cette méthode récompense la performance de pointe mais est moins 
 if not all_results:
     raise SystemExit("Aucun résultat à évaluer. L'entraînement a probablement échoué.")
 
-    # On filtre les résultats où le recall est de 1.0, car ils indiquent un modèle qui prédit '1' pour tout.
+# On filtre les résultats où le recall est de 1.0, car ils indiquent un modèle qui prédit '1' pour tout.
 valid_results = [r for r in all_results if r.metrics_test.get("recall", 0) < 1.0]
 
 if not valid_results:
-    print(
-        "\nAVERTISSEMENT : Tous les modèles ont un recall de 1.0. Aucun modèle valide n'a été trouvé selon les critères.")
-    print(
-        "Cela indique un problème systémique (peut-être des features qui fuient de l'information ou un déséquilibre extrême).")
-    print("Le script va s'arrêter. Veuillez analyser les résultats des plis.")
+    print("\nAVERTISSEMENT : Tous les modèles ont un recall de 1.0. Aucun modèle valide n'a été trouvé selon les critères.")
     raise SystemExit("Aucun modèle non-dégénéré trouvé.")
 
-# On trie les résultats valides par leur score AUC
-all_results_sorted_by_peak_auc = sorted(valid_results, key=lambda r: r.metrics_test.get("auc", 0), reverse=True)
+    # Définition du score combiné (vous pouvez ajuster les poids)
+
+def combined_score(res: EvalResult, auc_weight=0.6, precision_weight=0.4) -> float:
+    auc = res.metrics_test.get("auc", 0)
+    precision = res.metrics_test.get("precision", 0)
+    score = (auc_weight * auc) + (precision_weight * precision)
+    # On stocke le score pour l'afficher plus tard
+    res.extra['combined_score'] = score
+    return score
+
+# On trie les résultats valides par le score combiné
+all_results_sorted = sorted(valid_results, key=combined_score, reverse=True)
 
 # Le meilleur est le premier de la liste
-best_single_run = all_results_sorted_by_peak_auc[0]
+best_single_run = all_results_sorted[0]
 best_model_type = best_single_run.name
 
-print(
-    f"Le meilleur run individuel a été obtenu par '{best_single_run.name}' avec un AUC de {best_single_run.metrics_test.get('auc', 0):.4f} et un Recall de {best_single_run.metrics_test.get('recall', 0):.4f}.")
+print(f"Le meilleur run a été obtenu par '{best_single_run.name}' avec un score combiné de {best_single_run.extra.get('combined_score', 0):.4f}.")
+print(f"  -> Détails: AUC={best_single_run.metrics_test.get('auc', 0):.4f}, Precision={best_single_run.metrics_test.get('precision', 0):.4f}, Recall={best_single_run.metrics_test.get('recall', 0):.4f}")
 
 # --- PHASE 3: RÉ-ENTRAÎNEMENT DU MODÈLE FINAL POUR LE BACKTESTING ---
 print("\n" + "=" * 20 + " PHASE 3: RÉ-ENTRAÎNEMENT DU MODÈLE FINAL " + "=" * 20)
