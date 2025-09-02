@@ -28,7 +28,7 @@ except Exception:
 # -------------------------------
 # 1) Paramètres
 # -------------------------------
-FILE_PATH = "/home/emmanuel-raoul/newòn py/Antrènman_tès/XAUUSD_21_22.csv"
+FILE_PATH = "/home/emmanuel-raoul/newòn py/Antrènman_tès/XAUUSD_22_24.csv"
 OUTPUT_DIR = "Antrènan Bot Ichimoku/Antrènan Bot Ichimoku"
 RANDOM_STATE = 42
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -65,21 +65,32 @@ last_entries = df.groupby('ticket', as_index=False).tail(1)
 df = pd.concat([first_entries, last_entries]).drop_duplicates().reset_index(drop=True)
 
 # Feature engineering identique
+print("Calcul des features...")
+df['timeInput'] = pd.to_datetime(df['timeInput']) # Conversion essentielle pour la suite
+
+# NOUVELLE FEATURE: Heure de la journée pour capturer les dynamiques de session (Londres, NY, etc.)
+df['hour_of_day'] = df['timeInput'].dt.hour
+
 df['distance_to_sl_art'] = (df['price'] - df['sl']) / df['atrV']
 df['volatility_regime'] = (df['priceStd20V'] > df['priceStd20V'].rolling(100, min_periods=1).mean()).astype(int)
 df['prix_vs_ema200'] = (df['price'] - df['price'].rolling(200).mean()) / df['atrV']
 df['rsi_vs_ema_rsi'] = df['rsiV'] - df['rsiV'].rolling(14).mean()
 df['sl_size_in_atr'] = (df['price'] - df['sl']).abs() / df['atrV']
 
+# MISE À JOUR DE LA LISTE DE FEATURES
+# - Suppression de 'price', 'sl', 'tp' pour éviter la fuite de données (target leakage).
+# - Ajout de 'hour_of_day' pour le contexte temporel.
 FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
-            'price', 'distPriceToCloud', 'distKijunToCloud', 'volume', 'sl', 'tp',
+            'distPriceToCloud', 'distKijunToCloud', 'volume',
             'slope5V', 'slope10V', 'slope20V',
             'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
             'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
-            'sl_size_in_atr']
+            'sl_size_in_atr',
+            'hour_of_day']
 
 X = df[FEATURES].astype(np.float32).values
 y = df['result'].astype(int).values
+time_series = df['timeInput']
 
 # -------------------------------
 # 3) Split temporel 70/15/15
@@ -91,6 +102,7 @@ val_end = int(0.85 * N)
 X_train, y_train = X[:train_end], y[:train_end]
 X_val,   y_val   = X[train_end:val_end], y[train_end:val_end]
 X_test,  y_test  = X[val_end:], y[val_end:]
+time_train, time_val, time_test = time_series[:train_end], time_series[train_end:val_end], time_series[val_end:]
 
 print(f"Total samples: {N}")
 print(f"Splitting info: Train={len(X_train)}, Validation={len(X_val)}, Test={len(X_test)}")
@@ -108,11 +120,16 @@ class EvalResult:
     extra: Dict[str, Any]
 
 
-def search_best_threshold(y_true, y_prob, min_trades_per_month=10, total_months_in_dataset=24, data_fraction=0.15):
+def search_best_threshold(y_true, y_prob, time_data, min_trades_per_month=10):
     """
     Trouve le seuil qui maximise la précision tout en respectant une contrainte de fréquence de trading.
     """
-    num_months_in_slice = total_months_in_dataset * data_fraction
+    # Calcul dynamique du nombre de mois dans la période de données fournie
+    # CORRECTIF: np.timedelta64 ne supporte pas 'M' (mois) car sa durée est ambiguë.
+    # On calcule la durée en jours et on divise par la durée moyenne d'un mois (~30.44 jours).
+    duration_in_days = (time_data.max() - time_data.min()) / np.timedelta64(1, 'D')
+    duration_in_months = duration_in_days / 30.4375
+    num_months_in_slice = max(1.0, round(duration_in_months)) # Assure au moins 1 mois
     min_trades_required = int(min_trades_per_month * num_months_in_slice)
     print(f"    [Seuil] Recherche d'un seuil pour max(Précision) avec au moins {min_trades_required} trades...")
 
@@ -125,7 +142,8 @@ def search_best_threshold(y_true, y_prob, min_trades_per_month=10, total_months_
 
         if num_trades >= min_trades_required:
             precision = precision_score(y_true, y_pred, zero_division=0)
-            valid_thresholds.append({'threshold': t, 'precision': precision, 'num_trades': num_trades})
+            f1 = f1_score(y_true, y_pred, zero_division=0)
+            valid_thresholds.append({'threshold': t, 'precision': precision, 'f1': f1, 'num_trades': num_trades})
 
     if not valid_thresholds:
         print(
@@ -136,7 +154,8 @@ def search_best_threshold(y_true, y_prob, min_trades_per_month=10, total_months_
             num_trades = y_pred.sum()
             if num_trades >= min_trades_required:
                 precision = precision_score(y_true, y_pred, zero_division=0)
-                valid_thresholds.append({'threshold': t, 'precision': precision, 'num_trades': num_trades})
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+                valid_thresholds.append({'threshold': t, 'precision': precision, 'f1': f1, 'num_trades': num_trades})
 
     if not valid_thresholds:
         print(
@@ -147,17 +166,16 @@ def search_best_threshold(y_true, y_prob, min_trades_per_month=10, total_months_
             s = f1_score(y_true, y_pred, zero_division=0)
             if s > best_s:
                 best_s, best_t = s, t
-        y_pred_final = (y_prob >= best_t).astype(int)
-        final_precision = precision_score(y_true, y_pred_final, zero_division=0)
-        return best_t, final_precision
+        # Dans ce cas de repli, best_s est le F1-score
+        return best_t, best_s
 
-    # Parmi les seuils valides, on choisit celui avec la meilleure précision
-    best_candidate = max(valid_thresholds, key=lambda x: x['precision'])
+    # Parmi les seuils valides, on choisit celui avec le meilleur F1-Score pour équilibrer précision et rappel
+    best_candidate = max(valid_thresholds, key=lambda x: x['f1'])
 
     print(
-        f"    [Seuil] Meilleur seuil trouvé: {best_candidate['threshold']:.2f} -> Precision: {best_candidate['precision']:.4f} ({best_candidate['num_trades']} trades)")
+        f"    [Seuil] Meilleur seuil trouvé: {best_candidate['threshold']:.2f} -> F1: {best_candidate['f1']:.4f} (Precision: {best_candidate['precision']:.4f}, Trades: {best_candidate['num_trades']})")
 
-    return best_candidate['threshold'], best_candidate['precision']
+    return best_candidate['threshold'], best_candidate['f1']
 
 
 def evaluate_threshold(y_true, y_prob, t):
@@ -255,7 +273,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_precision = search_best_threshold(y_val, val_prob, data_fraction=0.15)
+    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, time_val)
 
     # Sauvegarde
     model_path_txt = os.path.join(OUTPUT_DIR, "lightgbm_model.txt")
@@ -264,7 +282,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
     joblib.dump(model, model_path_joblib)   # On sauvegarde l'objet compler pour la conversion
     print(f"[LightGBM] Modèle complet sauvegardé dans : {model_path_joblib}")
     with open(os.path.join(OUTPUT_DIR, "best_threshold_lgb.json"), "w") as f:
-        json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_precision)}, f, indent=2)
+        json.dump({"threshold": float(best_t), "best_val_f1": float(best_val_f1)}, f, indent=2)
 
     # Évaluation test
     test_prob = model.predict_proba(X_test)[:, 1]
@@ -278,7 +296,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
               .sort_values('gain', ascending=False).reset_index(drop=True)
     imp_df.to_csv(os.path.join(OUTPUT_DIR, 'lgb_feature_importance.csv'), index=False)
 
-    print(f"\n[LightGBM] Seuil optimal (val Precision): {best_t:.2f} (Precision): {best_val_precision:.4f}")
+    print(f"\n[LightGBM] Seuil optimal (basé sur F1): {best_t:.2f} (F1-score validation: {best_val_f1:.4f})")
     print("[LightGBM] Metrics test:", metrics_test)
     dump_conf_matrix(cm_test)
 
@@ -341,13 +359,13 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_precision = search_best_threshold(y_val, val_prob, data_fraction=0.15)
+    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, time_val)
 
     # Sauvegarde
     model_path = os.path.join(OUTPUT_DIR, "xgb_model.json")
     model.save_model(model_path)
     with open(os.path.join(OUTPUT_DIR, "best_threshold_xgb.json"), "w") as f:
-        json.dump({"threshold": float(best_t), "best_val_precision": float(best_val_precision)}, f, indent=2)
+        json.dump({"threshold": float(best_t), "best_val_f1": float(best_val_f1)}, f, indent=2)
 
     # Évaluation test
     test_prob = model.predict_proba(X_test)[:, 1]
@@ -365,7 +383,7 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
     }).sort_values('gain', ascending=False).reset_index(drop=True)
     imp_df.to_csv(os.path.join(OUTPUT_DIR, 'xgb_feature_importance.csv'), index=False)
 
-    print(f"\n[XGBoost] Seuil optimal (val Precision):{best_t:.2f} (Precision): {best_val_precision:.4}")
+    print(f"\n[XGBoost] Seuil optimal (basé sur F1): {best_t:.2f} (F1-score validation: {best_val_f1:.4f})")
     print("[XGBoost] Metrics test:", metrics_test)
     dump_conf_matrix(cm_test)
 
@@ -416,7 +434,7 @@ if 'LightGBM' in models and 'XGBoost' in models:
     ensemble_val_prob = (val_prod_lgb + val_prob_xgb) / 2.0
 
     # Recherche du meilleur seuil pour l'ensemble
-    best_t_ensemble, best_precision_ensemble_val = search_best_threshold(y_val, ensemble_val_prob, data_fraction=0.15)
+    best_t_ensemble, best_f1_ensemble_val = search_best_threshold(y_val, ensemble_val_prob, time_val)
 
     # Évaluation sur le set de test
     test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
@@ -430,13 +448,13 @@ if 'LightGBM' in models and 'XGBoost' in models:
     ensemble_result = EvalResult(
         name="Ensemble (LGB+XGB)",
         threshold=best_t_ensemble,
-        metrics_val={"precision": best_precision_ensemble_val}, # Simplifié pour le tri
+        metrics_val={"f1": best_f1_ensemble_val}, # Simplifié pour le tri
         metrics_test=metrics_test_ensemble,
         conf_matrix_test=cm_test_ensemble,
         extra={}
     )
     results.append(ensemble_result)
-    print(f"\n[Ensemble] Seuil optimal (val Precision):{best_t_ensemble:.2f} (Precision): {best_precision_ensemble_val:.4f}")
+    print(f"\n[Ensemble] Seuil optimal (basé sur F1): {best_t_ensemble:.2f} (F1-score validation: {best_f1_ensemble_val:.4f})")
     print("[Ensemble] Metrics test:", metrics_test_ensemble)
     dump_conf_matrix(cm_test_ensemble)
 
@@ -451,17 +469,17 @@ print("\nSélection du meilleur modèle basée sur un score équilibré (validat
 # On calcule un score combiné pour chaque résultat pour équilibrer la performance
 # sur le set de validation (vu pendant l'entraînement) et le set de test (jamais vu).
 for r in results:
-    val_precision = r.metrics_val.get("precision", 0)
-    test_precision = r.metrics_test.get("precision", 0)
+    val_f1 = r.metrics_val.get("f1", 0)
+    test_f1 = r.metrics_test.get("f1", 0)
     # Score pondéré 50/50. Favorise les modèles stables.
-    r.extra['combined_score'] = (0.5 * val_precision) + (0.5 * test_precision)
+    r.extra['combined_score'] = (0.5 * val_f1) + (0.5 * test_f1)
 
 results = sorted(results, key=lambda r: r.extra.get("combined_score", 0), reverse=True)
 best = results[0]
 
 print("\n========================")
 print("Meilleur modèle:", best.name)
-print(f"Score combiné (50% val_precision + 50% test_precision): {best.extra.get('combined_score', 0):.4f}")
+print(f"Score combiné (50% val_f1 + 50% test_f1): {best.extra.get('combined_score', 0):.4f}")
 print("Seuil optimal (défini sur la validation):", round(best.threshold, 4))
 print("Metrics validation:", best.metrics_val)
 print("Metrics test:", best.metrics_test)
