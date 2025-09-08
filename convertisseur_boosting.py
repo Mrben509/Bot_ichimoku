@@ -50,82 +50,139 @@ if not best_model_name or best_threshold is None:
     print("ERREUR: Le fichier résumé est incomplet ou corrompu. Il manque 'best_model' ou 'threshold'.")
     sys.exit(1)
 
-# --- 3. Charger le modèle correspondant ---
-model_file = ""
-model_type = ""
-model_to_convert = None
+def generate_c_code_for_model(model, model_type_name):
+    """Génère le code C pour un modèle, renomme la fonction et adapte la signature pour MQL5."""
+    print(f"Génération du code C pour le modèle {model_type_name}...")
+    code = m2c.exporters.export_to_c(model)
+    function_name = f"{model_type_name}_score"
+    code = code.replace("score", function_name)
+    # Rendre la signature plus idiomatique pour MQL5 et éviter les conflits de noms
+    code = code.replace("double * input", "const double &inputs[]")
+    code = code.replace("input[", "inputs[")
+    return code, function_name
 
-print(f"Le meilleur modèle identifié est : '{best_model_name}'")
+def load_xgb_model(path):
+    """Charge un modèle XGBoost et corrige le type de 'base_score' si nécessaire."""
+    model = xgb.XGBClassifier()
+    model.load_model(path)
+    # CORRECTIF : m2cgen attend un float, mais il peut être chargé comme une chaîne.
+    if hasattr(model, 'base_score') and isinstance(model.base_score, str):
+        print(f"AVERTISSEMENT: Le 'base_score' du modèle XGBoost est une chaîne ('{model.base_score}'). Conversion en float.")
+        try:
+            model.base_score = float(model.base_score)
+        except (ValueError, TypeError):
+            print("ERREUR: Impossible de convertir 'base_score' en float.")
+            sys.exit(1)
+    return model
 
-if "LightGBM" in best_model_name:
-    model_file = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
-    model_type = "lightgbm"
+# --- 3. Charger et convertir le(s) modèle(s) ---
+mqh_lines = []
+final_predict_function = ""
 
-
-    model_to_convert = joblib.load(model_file)
-
-elif "XGBoost" in best_model_name:
-    model_file = os.path.join(OUTPUT_DIR, "xgb_model.json")
-    model_type = "xgboost"
-    # Pour XGBoost, il est préférable de charger l'objet modèle
-    model_to_convert = xgb.XGBClassifier()
-    model_to_convert.load_model(model_file)
-else:
-    # On ne gère pas l'ensemble pour la conversion directe, car cela nécessiterait
-    # de convertir les deux modèles et de combiner leur logique en MQL5.
-    # On se concentre sur la conversion du meilleur modèle de base.
-    print(f"AVERTISSEMENT: Le modèle '{best_model_name}' n'est pas directement convertible.")
-    print("La conversion ne fonctionne que pour 'LightGBM' ou 'XGBoost' de base.")
-    sys.exit(1)
-
-if not os.path.exists(model_file):
-    print(f"ERREUR: Fichier modèle introuvable : '{model_file}'")
-    sys.exit(1)
-
-# --- 4. Générer le code C avec m2cgen ---
-print("Génération du code MQL5 avec m2cgen...")
-# On génère du code C, qui est très compatible avec MQL5.
-# La fonction générée prend un tableau de features en entrée et place le résultat (probabilités) dans un tableau de sortie.
-c_code = m2c.exporters.export_to_c(model_to_convert)
-
-# --- 5. Assembler le fichier .mqh ---
-# Rendre le code généré plus spécifique pour éviter les conflits de noms dans MQL5
-function_name = f"{model_type}_score"
-c_code = c_code.replace("score", function_name)
-
-# On assemble toutes les parties du fichier .mqh
-mqh_lines = [
+# --- Header commun pour le fichier .mqh ---
+mqh_header = [
     "//+------------------------------------------------------------------+",
     f"//|   {best_model_name} Predictor for MQL5",
     "//|   Généré par un script Python en utilisant m2cgen",
     "//+------------------------------------------------------------------+",
     "#property strict",
     "",
-    f"// --- Seuil optimal trouvé pendant l'entraînement (basé sur le F1-score de validation)",
+    f"// --- Seuil optimal trouvé pendant l'entraînement",
     f"const double BEST_THRESHOLD = {best_threshold:.6f};",
     "",
     "// --- Liste des features attendues par le modèle ---",
 ]
-# On ajoute la liste des features en commentaire pour faciliter le débogage dans MQL5
 for i, feature in enumerate(FEATURES):
-    mqh_lines.append(f"// {i}: {feature}")
+    mqh_header.append(f"// {i}: {feature}")
+mqh_header.append("")
 
-# On ajoute le code du modèle et une fonction "wrapper" pour simplifier son appel
-mqh_lines.extend([
-    "",
-    "// --- Code généré par m2cgen ---",
-    c_code,
-    "",
-    "// --- Fonction Wrapper pour une utilisation simple dans MQL5 ---",
-    f"// Retourne la probabilité de la classe 'Gagnant' (classe 1)",
-    f"double {best_model_name.split(' ')[0]}_Predict(const double &features[])",
-    "{",
-    "   double prediction[2]; // Sortie pour la classe 0 et la classe 1",
-    f"   {function_name}(features, prediction);",
-    "   return prediction[1]; // Retourne la probabilité de la classe 1 (Gagnant)",
-    "}",
-    "",
-])
+if "Ensemble" in best_model_name:
+    print("Le meilleur modèle est un Ensemble. Conversion des deux modèles de base (LGBM et XGBoost)...")
+
+    # Charger les deux modèles
+    lgbm_model_file = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
+    xgb_model_file = os.path.join(OUTPUT_DIR, "xgb_model.json")
+
+    try:
+        model_lgbm = joblib.load(lgbm_model_file)
+        model_xgb = load_xgb_model(xgb_model_file)
+    except FileNotFoundError as e:
+        print(f"ERREUR: Fichier modèle manquant pour l'ensemble : {e.filename}")
+        print("Assurez-vous que les deux modèles 'lightgbm_model.joblib' et 'xgb_model.json' existent.")
+        sys.exit(1)
+
+    # Générer le code C pour chaque modèle
+    c_code_lgbm, func_name_lgbm = generate_c_code_for_model(model_lgbm, "lightgbm")
+    c_code_xgb, func_name_xgb = generate_c_code_for_model(model_xgb, "xgboost")
+
+    # Assembler le fichier .mqh pour l'ensemble
+    mqh_lines.extend(mqh_header)
+    mqh_lines.extend([
+        "// --- Code généré pour LightGBM ---",
+        c_code_lgbm,
+        "",
+        "// --- Code généré pour XGBoost ---",
+        c_code_xgb,
+        "",
+        "// --- Fonction Wrapper pour l'Ensemble ---",
+        "// Retourne la moyenne des probabilités des deux modèles",
+        "double Ensemble_Predict(const double &features[])",
+        "{",
+        "   double pred_lgbm[2];",
+        "   double pred_xgb[2];",
+        "",
+        f"   {func_name_lgbm}(features, pred_lgbm);",
+        f"   {func_name_xgb}(features, pred_xgb);",
+        "",
+        "   // Retourne la moyenne des probabilités de la classe 1 (Gagnant)",
+        "   return (pred_lgbm[1] + pred_xgb[1]) / 2.0;",
+        "}",
+        "",
+    ])
+    final_predict_function = "Ensemble_Predict"
+
+elif "LightGBM" in best_model_name or "XGBoost" in best_model_name:
+    print(f"Le meilleur modèle identifié est : '{best_model_name}'")
+    model_file = ""
+    model_type = ""
+
+    try:
+        if "LightGBM" in best_model_name:
+            model_file = os.path.join(OUTPUT_DIR, "lightgbm_model.joblib")
+            model_type = "lightgbm"
+            model_to_convert = joblib.load(model_file)
+        elif "XGBoost" in best_model_name:
+            model_file = os.path.join(OUTPUT_DIR, "xgb_model.json")
+            model_type = "xgboost"
+            model_to_convert = load_xgb_model(model_file)
+    except FileNotFoundError:
+        print(f"ERREUR: Fichier modèle introuvable : '{model_file}'")
+        sys.exit(1)
+
+    # Générer le code C
+    c_code, function_name = generate_c_code_for_model(model_to_convert, model_type)
+
+    # Assembler le fichier .mqh
+    mqh_lines.extend(mqh_header)
+    mqh_lines.extend([
+        "// --- Code généré par m2cgen ---",
+        c_code,
+        "",
+        "// --- Fonction Wrapper pour une utilisation simple dans MQL5 ---",
+        f"// Retourne la probabilité de la classe 'Gagnant' (classe 1)",
+        f"double {best_model_name.split(' ')[0]}_Predict(const double &features[])",
+        "{",
+        "   double prediction[2]; // Sortie pour la classe 0 et la classe 1",
+        f"   {function_name}(features, prediction);",
+        "   return prediction[1]; // Retourne la probabilité de la classe 1 (Gagnant)",
+        "}",
+        "",
+    ])
+    final_predict_function = f"{best_model_name.split(' ')[0]}_Predict"
+
+else:
+    print(f"ERREUR: Type de modèle inconnu ou non géré : '{best_model_name}'")
+    sys.exit(1)
 
 # --- 6. Écrire le fichier de sortie ---
 output_mqh_path = os.path.join(OUTPUT_DIR, "boosting_model.mqh")
@@ -133,7 +190,7 @@ try:
     with open(output_mqh_path, "w", encoding="utf-8") as f:
         f.write("\n".join(mqh_lines))
     print(f"✅ Fichier '{output_mqh_path}' généré avec succès pour le modèle '{best_model_name}'.")
-    print(f"   Utilisez la fonction '{best_model_name.split(' ')[0]}_Predict()' dans votre EA.")
+    print(f"   Utilisez la fonction '{final_predict_function}()' dans votre EA.")
     print(f"   Le seuil optimal de {best_threshold:.4f} est disponible via la constante BEST_THRESHOLD.")
 except Exception as e:
     print(f"ERREUR: Impossible d'écrire le fichier de sortie : {e}")
