@@ -31,6 +31,7 @@ except Exception:
 FILE_PATH = "/home/emmanuel-raoul/newòn py/Antrènman_tès/XAUUSD_22_24.csv"
 OUTPUT_DIR = "Antrènan Bot Ichimoku/Antrènan Bot Ichimoku"
 RANDOM_STATE = 42
+MIN_WIN_RATE_CONSTRAINT = 0.55  # Ex: 55% de win rate (précision) minimum pour qu'un seuil soit considéré
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # -------------------------------
@@ -88,7 +89,7 @@ FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'laggin
             'sl_size_in_atr',
             'hour_of_day']
 
-X = df[FEATURES].astype(np.float32).values
+X = df[FEATURES] # On garde le DataFrame pour préserver les noms de features
 y = df['result'].astype(int).values
 time_series = df['timeInput']
 
@@ -120,9 +121,9 @@ class EvalResult:
     extra: Dict[str, Any]
 
 
-def search_best_threshold(y_true, y_prob, time_data, min_trades_per_month=10):
+def search_best_threshold(y_true, y_prob, time_data, min_trades_per_month=5, min_win_rate=0.0):
     """
-    Trouve le seuil qui maximise la précision tout en respectant une contrainte de fréquence de trading.
+    Trouve le seuil qui maximise le F1-Score tout en respectant des contraintes de fréquence et de win rate.
     """
     # Calcul dynamique du nombre de mois dans la période de données fournie
     # CORRECTIF: np.timedelta64 ne supporte pas 'M' (mois) car sa durée est ambiguë.
@@ -131,7 +132,7 @@ def search_best_threshold(y_true, y_prob, time_data, min_trades_per_month=10):
     duration_in_months = duration_in_days / 30.4375
     num_months_in_slice = max(1.0, round(duration_in_months)) # Assure au moins 1 mois
     min_trades_required = int(min_trades_per_month * num_months_in_slice)
-    print(f"    [Seuil] Recherche d'un seuil pour max(Précision) avec au moins {min_trades_required} trades...")
+    print(f"    [Seuil] Recherche d'un seuil pour max(F1) avec >= {min_trades_required} trades et un win rate >= {min_win_rate:.0%}...")
 
     thresholds = np.arange(0.99, 0.49, -0.01)  # On cherche d'abord dans la zone de haute probabilité
 
@@ -140,26 +141,29 @@ def search_best_threshold(y_true, y_prob, time_data, min_trades_per_month=10):
         y_pred = (y_prob >= t).astype(int)
         num_trades = y_pred.sum()
 
-        if num_trades >= min_trades_required:
+        if num_trades > 0: # Évite la division par zéro pour la précision
             precision = precision_score(y_true, y_pred, zero_division=0)
-            f1 = f1_score(y_true, y_pred, zero_division=0)
-            valid_thresholds.append({'threshold': t, 'precision': precision, 'f1': f1, 'num_trades': num_trades})
-
-    if not valid_thresholds:
-        print(
-            f"    [Seuil] AVERTISSEMENT: Aucun seuil > 0.5 n'a atteint les {min_trades_required} trades. Recherche sur toute la plage.")
-        thresholds = np.arange(0.49, 0.0, -0.01)
-        for t in thresholds:
-            y_pred = (y_prob >= t).astype(int)
-            num_trades = y_pred.sum()
-            if num_trades >= min_trades_required:
-                precision = precision_score(y_true, y_pred, zero_division=0)
+            # Application des deux contraintes
+            if num_trades >= min_trades_required and precision >= min_win_rate:
                 f1 = f1_score(y_true, y_pred, zero_division=0)
                 valid_thresholds.append({'threshold': t, 'precision': precision, 'f1': f1, 'num_trades': num_trades})
 
     if not valid_thresholds:
         print(
-            f"    [Seuil] AVERTISSEMENT: Aucun seuil n'a permis d'atteindre les {min_trades_required} trades. Retour au F1-score max comme fallback.")
+            f"    [Seuil] AVERTISSEMENT: Aucun seuil > 0.5 n'a atteint les contraintes. Recherche sur toute la plage.")
+        thresholds = np.arange(0.49, 0.0, -0.01)
+        for t in thresholds:
+            y_pred = (y_prob >= t).astype(int)
+            num_trades = y_pred.sum()
+            if num_trades > 0:
+                precision = precision_score(y_true, y_pred, zero_division=0)
+                if num_trades >= min_trades_required and precision >= min_win_rate:
+                    f1 = f1_score(y_true, y_pred, zero_division=0)
+                    valid_thresholds.append({'threshold': t, 'precision': precision, 'f1': f1, 'num_trades': num_trades})
+
+    if not valid_thresholds:
+        print(
+            f"    [Seuil] AVERTISSEMENT: Aucune combinaison de seuil ne respecte les contraintes. Retour au F1-score max comme fallback (sans contraintes).")
         best_t, best_s = 0.5, -np.inf
         for t in np.arange(0.01, 1.00, 0.01):
             y_pred = (y_prob >= t).astype(int)
@@ -173,7 +177,7 @@ def search_best_threshold(y_true, y_prob, time_data, min_trades_per_month=10):
     best_candidate = max(valid_thresholds, key=lambda x: x['f1'])
 
     print(
-        f"    [Seuil] Meilleur seuil trouvé: {best_candidate['threshold']:.2f} -> F1: {best_candidate['f1']:.4f} (Precision: {best_candidate['precision']:.4f}, Trades: {best_candidate['num_trades']})")
+        f"    [Seuil] Meilleur seuil trouvé: {best_candidate['threshold']:.2f} -> F1: {best_candidate['f1']:.4f} (Win Rate: {best_candidate['precision']:.4f}, Trades: {best_candidate['num_trades']})")
 
     return best_candidate['threshold'], best_candidate['f1']
 
@@ -248,16 +252,61 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         model = lgb.LGBMClassifier(**params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)])
 
-        preds_val_auc = model.predict_proba(X_val)[:, 1]
-        return roc_auc_score(y_val, preds_val_auc)
+        # --- NOUVELLE LOGIQUE MULTI-OBJECTIFS ---
+        # On cherche à optimiser la précision ET le rappel
+        preds_val = model.predict_proba(X_val)[:, 1]
+
+        # Recherche rapide du meilleur seuil F1 pour ce trial
+        best_t_trial, best_f1_trial = 0.5, -1.0
+        # Recherche rapide pour ne pas trop ralentir Optuna
+        for t in np.arange(0.2, 0.8, 0.05):
+            y_pred_trial = (preds_val >= t).astype(int)
+            f1 = f1_score(y_val, y_pred_trial, zero_division=0)
+            if f1 > best_f1_trial:
+                best_f1_trial = f1
+                best_t_trial = t
+
+        # Calcul des objectifs (précision et rappel) à ce seuil
+        y_pred_final = (preds_val >= best_t_trial).astype(int)
+        precision = precision_score(y_val, y_pred_final, zero_division=0)
+        recall = recall_score(y_val, y_pred_final, zero_division=0)
+
+        # NOUVELLE PÉNALITÉ: On veut éviter les modèles dégénérés qui prédisent 1 pour tout.
+        # Un rappel parfait (ou presque) est un très mauvais signe.
+        if recall > 0.99:
+            return 0.0, 0.0  # Retourne un score très faible pour qu'Optuna élague cette branche
+
+        return precision, recall
 
     print("\n[LightGBM] Recherche des hyperparamètres avec optuna…")
-    study = optuna.create_study(direction="maximize")
+    # On demande à Optuna de maximiser la précision ET le rappel
+    # On ajoute un Pruner pour arrêter les essais non prometteurs et gagner du temps
+    study = optuna.create_study(
+        directions=["maximize", "maximize"], pruner=optuna.pruners.MedianPruner()
+    )
     study.optimize(objective_lgb, n_trials=50)  # Argumenten_trials pour meilleure recherche
+
+    # --- NOUVELLE LOGIQUE DE SÉLECTION DU MEILLEUR TRIAL ---
+    # Parmi les "meilleurs compromis" (front de Pareto), on choisit celui qui a le meilleur F1-Score
+    best_trial = None
+    best_f1_from_objectives = -1.0
+
+    # study.best_trials contient la liste des solutions non-dominées
+    for trial in study.best_trials:
+        precision, recall = trial.values
+        # On recalcule le F1 à partir des objectifs retournés par le trial
+        if precision + recall > 0:
+            f1 = 2 * (precision * recall) / (precision + recall)
+            if f1 > best_f1_from_objectives:
+                best_f1_from_objectives = f1
+                best_trial = trial
+
+    if best_trial is None:
+        raise RuntimeError("Optuna n'a trouvé aucun trial valide. Essayez d'augmenter n_trials.")
 
     # 2. Entraînement final avec les meilleurs paramètres
     print("\n[LightGBM Entraînement final avec les meilleurs paramètres…]")
-    best_params = study.best_params.copy()  # Copy pour évité de modifier l'objet de l'étude
+    best_params = best_trial.params.copy()  # On prend les paramètres du meilleur compromis
     best_params.update({
         'objective': 'binary',
         'metric': 'binary_logloss',
@@ -273,7 +322,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, time_val)
+    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, time_val, min_win_rate=MIN_WIN_RATE_CONSTRAINT)
 
     # Sauvegarde
     model_path_txt = os.path.join(OUTPUT_DIR, "lightgbm_model.txt")
@@ -305,8 +354,8 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         threshold=best_t,
         metrics_val=metrics_val,
         metrics_test=metrics_test,
-        conf_matrix_test=cm_test,
-        extra={"model_path": model_path_joblib}
+        conf_matrix_test=cm_test, # On ajoute les probas du test pour la simulation monte carlo
+        extra={"model_path": model_path_joblib, "test_prob": test_prob}
     ), model
 
 # -------------------------------
@@ -337,16 +386,51 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
         model = XGBClassifier(n_estimators=1000, early_stopping_rounds=100, **params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-        preds_val_auc = model.predict_proba(X_val)[:, 1]
-        return roc_auc_score(y_val, preds_val_auc)
+        # --- NOUVELLE LOGIQUE MULTI-OBJECTIFS ---
+        preds_val = model.predict_proba(X_val)[:, 1]
+        best_t_trial, best_f1_trial = 0.5, -1.0
+        for t in np.arange(0.2, 0.8, 0.05):
+            y_pred_trial = (preds_val >= t).astype(int)
+            f1 = f1_score(y_val, y_pred_trial, zero_division=0)
+            if f1 > best_f1_trial:
+                best_f1_trial = f1
+                best_t_trial = t
+
+        y_pred_final = (preds_val >= best_t_trial).astype(int)
+        precision = precision_score(y_val, y_pred_final, zero_division=0)
+        recall = recall_score(y_val, y_pred_final, zero_division=0)
+
+        # NOUVELLE PÉNALITÉ: On veut éviter les modèles dégénérés qui prédisent 1 pour tout.
+        # Un rappel parfait (ou presque) est un très mauvais signe.
+        if recall > 0.99:
+            return 0.0, 0.0  # Retourne un score très faible pour qu'Optuna élague cette branche
+
+        return precision, recall
 
     print("\n[XGBoost] Recherche des hyperparamètres avec Optuna…")
-    study = optuna.create_study(direction="maximize")
+    # On ajoute un Pruner pour arrêter les essais non prometteurs et gagner du temps
+    study = optuna.create_study(
+        directions=["maximize", "maximize"], pruner=optuna.pruners.MedianPruner()
+    )
     study.optimize(objective_xgb, n_trials=50)   # Augmenter le n_trials pour une meilleurs recherche
+
+    # --- NOUVELLE LOGIQUE DE SÉLECTION DU MEILLEUR TRIAL ---
+    best_trial = None
+    best_f1_from_objectives = -1.0
+    for trial in study.best_trials:
+        precision, recall = trial.values
+        if precision + recall > 0:
+            f1 = 2 * (precision * recall) / (precision + recall)
+            if f1 > best_f1_from_objectives:
+                best_f1_from_objectives = f1
+                best_trial = trial
+
+    if best_trial is None:
+        raise RuntimeError("Optuna n'a trouvé aucun trial valide. Essayez d'augmenter n_trials.")
 
     # 2. Entrainement final avec les meilleurs paramètres
     print("\n[XGBoost] Entraînement final avec les meilleurs paramètres…")
-    best_params = study.best_params
+    best_params = best_trial.params
     if scale_pos_weight is not None:
         best_params["scale_pos_weight"] = float(scale_pos_weight)
 
@@ -359,7 +443,7 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
 
     # Probabilités validation & recherche seuil
     val_prob = model.predict_proba(X_val)[:, 1]
-    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, time_val)
+    best_t, best_val_f1 = search_best_threshold(y_val, val_prob, time_val, min_win_rate=MIN_WIN_RATE_CONSTRAINT)
 
     # Sauvegarde
     model_path = os.path.join(OUTPUT_DIR, "xgb_model.json")
@@ -393,7 +477,8 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
         metrics_val=metrics_val,
         metrics_test=metrics_test,
         conf_matrix_test=cm_test,
-        extra={"model_path": model_path}
+        # On ajoute les probas du test pour la simulation monte carlo
+        extra={"model_path": model_path, "test_prob": test_prob}
     ), model
 
 # -------------------------------
@@ -434,7 +519,7 @@ if 'LightGBM' in models and 'XGBoost' in models:
     ensemble_val_prob = (val_prod_lgb + val_prob_xgb) / 2.0
 
     # Recherche du meilleur seuil pour l'ensemble
-    best_t_ensemble, best_f1_ensemble_val = search_best_threshold(y_val, ensemble_val_prob, time_val)
+    best_t_ensemble, best_f1_ensemble_val = search_best_threshold(y_val, ensemble_val_prob, time_val, min_win_rate=MIN_WIN_RATE_CONSTRAINT)
 
     # Évaluation sur le set de test
     test_prob_lgb = model_lgb.predict_proba(X_test)[:, 1]
@@ -449,9 +534,9 @@ if 'LightGBM' in models and 'XGBoost' in models:
         name="Ensemble (LGB+XGB)",
         threshold=best_t_ensemble,
         metrics_val={"f1": best_f1_ensemble_val}, # Simplifié pour le tri
-        metrics_test=metrics_test_ensemble,
+        metrics_test=metrics_test_ensemble, # On ajoute les probas du test pour la simulation monte carlos
         conf_matrix_test=cm_test_ensemble,
-        extra={}
+        extra={"test_prob": ensemble_test_prob}
     )
     results.append(ensemble_result)
     print(f"\n[Ensemble] Seuil optimal (basé sur F1): {best_t_ensemble:.2f} (F1-score validation: {best_f1_ensemble_val:.4f})")
@@ -469,17 +554,31 @@ print("\nSélection du meilleur modèle basée sur un score équilibré (validat
 # On calcule un score combiné pour chaque résultat pour équilibrer la performance
 # sur le set de validation (vu pendant l'entraînement) et le set de test (jamais vu).
 for r in results:
-    val_f1 = r.metrics_val.get("f1", 0)
-    test_f1 = r.metrics_test.get("f1", 0)
-    # Score pondéré 50/50. Favorise les modèles stables.
-    r.extra['combined_score'] = (0.5 * val_f1) + (0.5 * test_f1)
+    val_f1 = r.metrics_val.get("f1", 0.0)
+    test_f1 = r.metrics_test.get("f1", 0.0)
+    val_auc = r.metrics_val.get("auc", 0.0)
+    test_auc = r.metrics_test.get("auc", 0.0)
+
+    # Pénalité pour les modèles dégénérés sur le set de test (double sécurité)
+    if r.metrics_test.get("recall", 0.0) > 0.99:
+        combined_score = 0.0
+    else:
+        # Score combiné qui équilibre F1 (performance équilibrée) et AUC (pouvoir discriminant)
+        # On pondère aussi la performance sur validation et test pour la robustesse
+        combined_f1 = (0.5 * val_f1) + (0.5 * test_f1)
+        combined_auc = (0.5 * val_auc) + (0.5 * test_auc)
+
+        # Score final: 60% F1, 40% AUC. Favorise un bon équilibre (F1) avec un bon pouvoir de tri (AUC).
+        combined_score = (0.6 * combined_f1) + (0.4 * combined_auc)
+
+    r.extra['combined_score'] = combined_score
 
 results = sorted(results, key=lambda r: r.extra.get("combined_score", 0), reverse=True)
 best = results[0]
 
 print("\n========================")
 print("Meilleur modèle:", best.name)
-print(f"Score combiné (50% val_f1 + 50% test_f1): {best.extra.get('combined_score', 0):.4f}")
+print(f"Score combiné (F1 + AUC, val + test): {best.extra.get('combined_score', 0):.4f}")
 print("Seuil optimal (défini sur la validation):", round(best.threshold, 4))
 print("Metrics validation:", best.metrics_val)
 print("Metrics test:", best.metrics_test)
@@ -494,6 +593,64 @@ summary = {
 }
 with open(os.path.join(OUTPUT_DIR, "summary_boosting.json"), "w") as f:
     json.dump(summary, f, indent=2)
+
+
+def run_monte_carlo_simulation(y_test, test_probabilities, threshold, n_simulations=5000):
+    print("\n" + "=" * 20 + " Analyse de Risque par Simulation Monte Carlo " + "=" * 20)
+
+    # 1. Identifier les trades que le modèle prendrait sur le jeu de test
+    trade_indices = np.where(test_probabilities >= threshold)[0]
+    if len(trade_indices) == 0:
+        print("Le modèle ne prend aucun trade sur le jeu de test avec ce seuil. Simulation impossible.")
+        return
+
+    # 2. Récupérer les probabilités et les vrais résultats pour ces trades
+    actual_outcomes = y_test[trade_indices]
+    model_probs_for_trades = test_probabilities[trade_indices]
+
+    print(f"Simulation de {n_simulations} 'histoires alternatives' pour les {len(trade_indices)} trades du backtest...")
+
+    simulation_results = []
+    for _ in range(n_simulations):
+        # Pour chaque trade, on tire un nombre aléatoire
+        random_draws = np.random.rand(len(trade_indices))
+        # Le trade est une 'victoire simulée' si le tirage est inférieur à la probabilité du modèle
+        simulated_wins = (random_draws < model_probs_for_trades).sum()
+        simulation_results.append(simulated_wins)
+
+    # 3. Analyser la distribution des résultats
+    simulation_results = np.array(simulation_results)
+    actual_wins = actual_outcomes.sum()
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(simulation_results, bins=max(10, int(np.max(simulation_results) - np.min(simulation_results))), alpha=0.75,
+             label="Distribution des victoires simulées")
+    plt.axvline(actual_wins, color='red', linestyle='--', linewidth=2,
+                label=f"Résultat réel du backtest ({actual_wins} victoires)")
+    plt.axvline(np.mean(simulation_results), color='black', linestyle='-', linewidth=2,
+                label=f"Moyenne simulée ({np.mean(simulation_results):.1f} victoires)")
+    plt.title(f"Distribution Monte Carlo des Victoires ({n_simulations} simulations)")
+    plt.xlabel("Nombre de victoires dans le backtest")
+    plt.ylabel("Fréquence")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    fig_path = os.path.join(OUTPUT_DIR, "monte_carlo_simulation.png")
+    plt.savefig(fig_path, dpi=130)
+    print(f"\nGraphique de la simulation Monte Carlo sauvegardé : {fig_path}")
+
+    # 4. Afficher les statistiques clés
+    p5 = np.percentile(simulation_results, 5)
+    p95 = np.percentile(simulation_results, 95)
+
+    print("\nStatistiques de la simulation Monte Carlo:")
+    print(f"  - Nombre de trades analysés: {len(trade_indices)}")
+    print(f"  - Win rate réel du backtest: {actual_wins / len(trade_indices):.2%}")
+    print("-" * 30)
+    print(f"  - Nombre moyen de victoires attendu: {np.mean(simulation_results):.1f}")
+    print(f"  - Scénario pessimiste (5% de chance d'avoir moins de victoires): {int(p5)} victoires")
+    print(f"  - Scénario optimiste (5% de chance d'avoir plus de victoires): {int(p95)} victoires")
+
 
 # -------------------------------
 # 9) (Optionnel) Affichage matrice de confusion du meilleur modèle
@@ -513,5 +670,13 @@ try:
     print(f"Matrice de confusion sauvegardée: {fig_path}")
 except Exception as e:
     print("Impossible de tracer la matrice de confusion:", e)
+
+# -------------------------------
+# 10) Lancement de la simulation Monte Carlo sur le meilleur modèle
+# -------------------------------
+if best.extra.get("test_prob") is not None:
+    run_monte_carlo_simulation(y_test, best.extra["test_prob"], best.threshold)
+else:
+    print("\nAVERTISSEMENT: Aucune probabilité de test trouvée pour le meilleur modèle, simulation Monte Carlo annulée.")
 
 print("\nFini.")
