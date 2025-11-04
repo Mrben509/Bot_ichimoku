@@ -28,7 +28,7 @@ except Exception:
 # -------------------------------
 # 1) Paramètres
 # -------------------------------
-FILE_PATH = "/home/emmanuel-raoul/newòn py/Antrènman_tès/N_XAUUSD_21_22.csv"
+FILE_PATH = "C:/Users/pc/Documents/data_science/signal_history_NDX100.csv"
 OUTPUT_DIR = "Antrènan Bot Ichimoku/Antrènan Bot Ichimoku"
 RANDOM_STATE = 42
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -37,7 +37,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # 2) Lecture + feature engineering (identiques à ton MLP)
 # -------------------------------
 required_columns = ['ticket', 'type', 'result', 'rsiV', 'atrV',
-                    'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
+                    'tenkan', 'kijun', 'spanA', 'spanB',
                     'timeInput', 'timeOutput', 'price', 'distPriceToCloud',
                     'distKijunToCloud', 'volume', 'sl', 'tp', 'slope5V', 'slope10V', 'slope20V',
                     'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V']
@@ -71,7 +71,7 @@ df['prix_vs_ema200'] = (df['price'] - df['price'].rolling(200).mean()) / df['atr
 df['rsi_vs_ema_rsi'] = df['rsiV'] - df['rsiV'].rolling(14).mean()
 df['sl_size_in_atr'] = (df['price'] - df['sl']).abs() / df['atrV']
 
-FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
+FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB',
             'price', 'distPriceToCloud', 'distKijunToCloud', 'volume', 'sl', 'tp',
             'slope5V', 'slope10V', 'slope20V',
             'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
@@ -80,6 +80,14 @@ FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'laggin
 
 X = df[FEATURES].astype(np.float32).values
 y = df['result'].astype(int).values
+
+# S'assurer que les classes commencent à 0 et sont consécutives
+unique_classes = np.unique(y)
+if len(unique_classes) == 3 and -1 in unique_classes:
+    # Si les classes sont -1, 0, 1, on les transforme en 0, 1, 2
+    y = y + 1
+    print("Classes transformées de [-1, 0, 1] à [0, 1, 2]")
+print(f"Classes uniques après transformation: {np.unique(y)}")
 
 # -------------------------------
 # 3) Split temporel 70/15/15
@@ -158,13 +166,18 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
         Returns:
             None
         """
+        # Déterminer si c'est une classification binaire ou multiclasse
+        num_classes = len(np.unique(y_train))
+        is_binary = num_classes == 2
+        
         # Define hyperparameters
         params = {
-            'objective': 'binary',  # Binary classification objective
-            'metric': 'binary_logloss',  # Binary log loss metric
-            'verbosity': -1,  # Silent output
-            'seed': RANDOM_STATE,  # Random seed
-            'deterministic': True,  # Deterministic mode
+            'objective': 'binary' if is_binary else 'multiclass',
+            'metric': 'binary_logloss' if is_binary else 'multi_logloss',
+            'num_class': None if is_binary else num_classes,
+            'verbosity': -1,
+            'seed': RANDOM_STATE,
+            'deterministic': True,
             'n_estimators': 1000,  # Number of boosting rounds
             'learning_rate': trial.suggest_float(  # Learning rate
                 'learning_rate', 0.01, 0.1, log=True),
@@ -202,10 +215,12 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
     study.optimize(objective_lgb, n_trials=50)  # Argumenten_trials pour meilleure recherche
 
     # 2. Entraînement final avec les meilleurs paramètres
-    print("\n[LightGBMEntraînement final avec les meilleurs paramètres…]")
+    print("\n[LightGBM] Entraînement final avec les meilleurs paramètres…")
     best_params = study.best_params
-    best_params["objective"] = "binary"
-    best_params["metric"] = "binary_logloss"
+    best_params["objective"] = 'binary' if len(np.unique(y_train)) == 2 else 'multiclass'
+    best_params["metric"] = 'binary_logloss' if len(np.unique(y_train)) == 2 else 'multi_logloss'
+    if len(np.unique(y_train)) > 2:
+        best_params["num_class"] = len(np.unique(y_train))
     best_params["seed"] = RANDOM_STATE
     best_params["verbosity"] = -1
     if scale_pos_weight is not None:
@@ -265,9 +280,13 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
     if not HAS_XGB:
         raise RuntimeError("XGBoost introuvable dans l'environnement.")
     def objective_xgb(trial):
+        # Determine if this is a binary classification problem
+        num_classes = len(np.unique(y_train))
+        is_binary = num_classes == 2
+        
         params = {
-            'objective' : 'binary:logistic',
-            'eval_metric' : 'logloss',
+            'objective' : 'binary:logistic' if is_binary else 'multi:softprob',
+            'eval_metric' : 'logloss' if is_binary else 'mlogloss',
             'tree_method' : 'hist',
             'n_jobs' : -1,
             'random_state' : RANDOM_STATE,
@@ -280,23 +299,54 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
             'min_child_weight' : trial.suggest_int('min_child_weight', 1, 10),
 
         }
+        # Configurer les paramètres en fonction du type de classification
+        if is_binary:
+            params['objective'] = 'binary:logistic'
+            params['eval_metric'] = 'logloss'
+        else:
+            params['objective'] = 'multi:softprob'
+            params['eval_metric'] = 'mlogloss'
+            params['num_class'] = num_classes
+            
         if scale_pos_weight is not None:
             params["scale_pos_weight"] = float(scale_pos_weight)
 
         model = XGBClassifier(n_estimators=1000, early_stopping_rounds=100, **params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-
-        preds_val = model.predict_proba(X_val)[:, 1]
-        best_t, best_f1 = search_best_threshold(y_val, preds_val)
-        return best_f1
+        
+        try:
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+            
+            if is_binary:
+                preds_val = model.predict_proba(X_val)[:, 1]
+            else:
+                preds_val = model.predict_proba(X_val)
+                
+            best_t, best_f1 = search_best_threshold(y_val, preds_val)
+            return best_f1
+        except Exception as e:
+            print(f"Erreur lors de l'entraînement: {str(e)}")
+            return 0.0  # Retourne un score de 0 en cas d'erreur
 
     print("\n[XGBoost] Recherche des hyperparamètres avec Optuna…")
     study = optuna.create_study(direction="maximize")
     study.optimize(objective_xgb, n_trials=50)   # Augmenter le n_trials pour une meilleurs recherche
 
-    # 2. Entrainement final avec les meilleurs paramètres
+    # 2. Entraînement final avec les meilleurs paramètres
     print("\n[XGBoost] Entraînement final avec les meilleurs paramètres…")
     best_params = study.best_params
+    
+    # Configurer les paramètres en fonction du type de classification
+    num_classes = len(np.unique(y_train))
+    is_binary = num_classes == 2
+    
+    if is_binary:
+        best_params['objective'] = 'binary:logistic'
+        best_params['eval_metric'] = 'logloss'
+    else:
+        best_params['objective'] = 'multi:softprob'
+        best_params['eval_metric'] = 'mlogloss'
+        best_params['num_class'] = num_classes
+        
     if scale_pos_weight is not None:
         best_params["scale_pos_weight"] = float(scale_pos_weight)
 
@@ -308,7 +358,11 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
     )
 
     # Probabilités validation & recherche seuil
-    val_prob = model.predict_proba(X_val)[:, 1]
+    if is_binary:
+        val_prob = model.predict_proba(X_val)[:, 1]
+    else:
+        val_prob = model.predict_proba(X_val)
+        
     best_t, best_val_f1 = search_best_threshold(y_val, val_prob, metric="f1")
 
     # Sauvegarde
@@ -318,10 +372,19 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
         json.dump({"threshold": float(best_t), "best_val_f1": float(best_val_f1)}, f, indent=2)
 
     # Évaluation test
-    test_prob = model.predict_proba(X_test)[:, 1]
+    if is_binary:
+        test_prob = model.predict_proba(X_test)[:, 1]
+    else:
+        test_prob = model.predict_proba(X_test)
+        
     metrics_val, _ = evaluate_threshold(y_val, val_prob, best_t)
     metrics_test, y_pred_test = evaluate_threshold(y_test, test_prob, best_t)
     cm_test = confusion_matrix(y_test, y_pred_test)
+    
+    # Afficher le rapport de classification pour plus d'informations
+    from sklearn.metrics import classification_report
+    print("\nRapport de classification sur l'ensemble de test:")
+    print(classification_report(y_test, y_pred_test))
 
     # Importance des features (gain)
     booster = model.get_booster()
