@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Any
 
 from lightgbm import early_stopping
@@ -28,17 +29,21 @@ except Exception:
 # -------------------------------
 # 1) Paramètres
 # -------------------------------
-FILE_PATH = "/home/emmanuel-raoul/newòn py/Antrènman_tès/XAUUSD_22_24.csv"
-OUTPUT_DIR = "Antrènan Bot Ichimoku/Antrènan Bot Ichimoku"
+FILE_PATH = "C:/Users/pc/Documents/data_science/XAUUSD_clean.csv"
+# Utiliser un nom de dossier sans accents pour une meilleure compatibilité
+OUTPUT_DIR_NAME = "Bot_Ichimoku_Training"
 RANDOM_STATE = 42
 MIN_WIN_RATE_CONSTRAINT = 0.55  # Ex: 55% de win rate (précision) minimum pour qu'un seuil soit considéré
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Construire un chemin absolu et créer le dossier avec pathlib
+OUTPUT_DIR = Path(__file__).parent / OUTPUT_DIR_NAME
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------------------
 # 2) Lecture + feature engineering (identiques à ton MLP)
 # -------------------------------
 required_columns = ['ticket', 'type', 'result', 'rsiV', 'atrV',
-                    'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
+                    'tenkan', 'kijun', 'spanA', 'spanB',
                     'timeInput', 'timeOutput', 'price', 'distPriceToCloud',
                     'distKijunToCloud', 'volume', 'sl', 'tp', 'slope5V', 'slope10V', 'slope20V',
                     'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V']
@@ -81,7 +86,7 @@ df['sl_size_in_atr'] = (df['price'] - df['sl']).abs() / df['atrV']
 # MISE À JOUR DE LA LISTE DE FEATURES
 # - Suppression de 'price', 'sl', 'tp' pour éviter la fuite de données (target leakage).
 # - Ajout de 'hour_of_day' pour le contexte temporel.
-FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
+FEATURES = ['type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB',
             'distPriceToCloud', 'distKijunToCloud', 'volume',
             'slope5V', 'slope10V', 'slope20V',
             'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
@@ -284,7 +289,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eva
     study = optuna.create_study(
         directions=["maximize", "maximize"], pruner=optuna.pruners.MedianPruner()
     )
-    study.optimize(objective_lgb, n_trials=50)  # Argumenten_trials pour meilleure recherche
+    study.optimize(objective_lgb, n_trials=150)  # Argumenten_trials pour meilleure recherche
 
     # --- NOUVELLE LOGIQUE DE SÉLECTION DU MEILLEUR TRIAL ---
     # Parmi les "meilleurs compromis" (front de Pareto), on choisit celui qui a le meilleur F1-Score
@@ -412,7 +417,7 @@ def train_xgboost(X_train, y_train, X_val, y_val, scale_pos_weight=None) -> Eval
     study = optuna.create_study(
         directions=["maximize", "maximize"], pruner=optuna.pruners.MedianPruner()
     )
-    study.optimize(objective_xgb, n_trials=50)   # Augmenter le n_trials pour une meilleurs recherche
+    study.optimize(objective_xgb, n_trials=150)   # Augmenter le n_trials pour une meilleurs recherche
 
     # --- NOUVELLE LOGIQUE DE SÉLECTION DU MEILLEUR TRIAL ---
     best_trial = None

@@ -18,19 +18,21 @@ except ImportError as e:
 
 # --- 1. Configuration ---
 # Chemins et constantes définis dans le script d'entraînement.
-# Assurez-vous que ce chemin est correct.
-OUTPUT_DIR = "Antrènan Bot Ichimoku/Antrènan Bot Ichimoku"
+# Le nom du dossier doit correspondre à celui défini dans le script d'entraînement.
+OUTPUT_DIR_NAME = "Bot_Ichimoku_Training"
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), OUTPUT_DIR_NAME)
 SUMMARY_PATH = os.path.join(OUTPUT_DIR, "summary_boosting.json")
 
 # IMPORTANT : Cette liste de features doit correspondre EXACTEMENT à celle
 # utilisée dans votre script d'entraînement `ml_XgBoost_&_LightGbm.py`.
 FEATURES = [
-    'type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB', 'lagging',
-    'price', 'distPriceToCloud', 'distKijunToCloud', 'volume', 'sl', 'tp',
+    'type', 'rsiV', 'atrV', 'tenkan', 'kijun', 'spanA', 'spanB',
+    'distPriceToCloud', 'distKijunToCloud', 'volume',
     'slope5V', 'slope10V', 'slope20V',
     'priceStd5V', 'priceStd10V', 'priceStd20V', 'zScore50V',
     'distance_to_sl_art', 'volatility_regime', 'prix_vs_ema200', 'rsi_vs_ema_rsi',
-    'sl_size_in_atr'
+    'sl_size_in_atr',
+    'hour_of_day'
 ]
 
 # --- 2. Lire le résumé pour identifier le meilleur modèle ---
@@ -73,6 +75,12 @@ def load_xgb_model(path):
         except (ValueError, TypeError):
             print("ERREUR: Impossible de convertir 'base_score' en float.")
             sys.exit(1)
+    # CORRECTIF 2 : Pour les modèles 'gblinear', base_score peut être une liste.
+    # On extrait la première valeur si c'est le cas.
+    if hasattr(model, 'base_score') and isinstance(model.base_score, list):
+        if len(model.base_score) > 0:
+            print(f"AVERTISSEMENT: Le 'base_score' du modèle XGBoost est une liste. Utilisation de la première valeur : {model.base_score[0]}.")
+            model.base_score = model.base_score[0]
     return model
 
 # --- 3. Charger et convertir le(s) modèle(s) ---
